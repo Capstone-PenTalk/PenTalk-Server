@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Socket Room Test</title>
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+  <h2>Socket Room 테스트</h2>
+
+  <div id="errorBox" style="
+    display:none;
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid #ff4d4f;
+    background: #fff1f0;
+    color: #a8071a;
+    border-radius: 8px;
+    font-weight: 600;
+  "></div>
+
+  <div id="successBox" style="
+    display:none;
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid #52c41a;
+    background: #f6ffed;
+    color: #389e0d;
+    border-radius: 8px;
+    font-weight: 600;
+  "></div>
+
+  <input id="roomId" placeholder="Room ID 입력" />
+  <button onclick="joinRoom()">입장</button>
+
+  <br><br>
+
+  <input id="msg" placeholder="메시지 입력" />
+  <button onclick="sendMsg()">채팅 전송</button>
+  <button onclick="sendDM()">DM 전송(교사)</button>
+
+  <ul id="log"></ul>
+
+<script>
+const params = new URLSearchParams(location.search);
+const role = params.get('role') || 'student';
+
+// 1) URL ?token=... 있으면 그걸 쓰고
+// 2) 없으면 localStorage에서 가져오기
+const token = params.get('token') || localStorage.getItem('token');
+
+const socket = io({
+  query: { role },     // 지금 방식 유지
+  auth: { token }      // ✅ JWT 전달 (권장 방식)
+});
+
+
+socket.on('connect', () => {
+  log(`서버 연결됨 (role=${role})`);
+});
+
+socket.on('receive-message', (msg) => {
+  log('💬 채팅: ' + msg);
+});
+
+socket.on('receive-dm', (data) => {
+  log('📢 DM: ' + data.message);
+});
+
+  socket.on('join-success', (data) => {
+    showSuccess('✅ 입장 성공: ' + data.roomId);
+    log('✅ 입장 성공: ' + data.roomId);
+  });
+
+  socket.on('server-error', (err) => {
+    if (err.code === 'SESSION_NOT_FOUND') {
+      showError('❌ 입장 거부: 존재하지 않는 세션입니다.');
+      log('❌ 입장 거부: 존재하지 않는 세션');
+    } else if (err.code === 'MISSING_ROOM_ID') {
+      showError('❌ 입장 거부: Room ID가 비어있습니다.');
+      log('❌ 입장 거부: Room ID가 없음');
+    } else if (err.code === 'FORBIDDEN') {
+    showError('❌ 권한 없음: 교사만 DM을 보낼 수 있습니다.');
+      log('❌ 권한 없음: DM은 교사만 가능');
+    } else {
+      showError('❌ 에러: ' + err.code);
+      log('❌ 에러: ' + err.code);
+    }
+  });
+
+  function joinRoom() {
+  clearError();
+  clearSuccess();
+
+  const roomId = document.getElementById('roomId').value;
+
+  socket.emit('join-room', { roomId });
+  log('방 입장 시도: ' + roomId);
+}
+
+  function sendMsg() {
+  const msg = document.getElementById('msg').value;
+
+  socket.emit('send-message', { msg });
+
+  // ✅ 내 화면에는 즉시 '보냄' 표시
+  log('보냄(채팅): ' + msg);
+}
+
+
+  function sendDM() {
+    const message = document.getElementById('msg').value;
+    socket.emit('teacher-send-dm', { message });
+    log('📤 DM 전송: ' + message);
+  }
+
+  function log(text) {
+    const li = document.createElement('li');
+    li.innerText = text;
+    document.getElementById('log').appendChild(li);
+  }
+
+  function showError(text) {
+    const box = document.getElementById('errorBox');
+    box.textContent = text;
+    box.style.display = 'block';
+  }
+
+  function clearError() {
+    const box = document.getElementById('errorBox');
+    box.textContent = '';
+    box.style.display = 'none';
+  }
+
+  function showSuccess(text) {
+    const box = document.getElementById('successBox');
+    box.textContent = text;
+    box.style.display = 'block';
+  }
+
+  function clearSuccess() {
+    const box = document.getElementById('successBox');
+    box.textContent = '';
+    box.style.display = 'none';
+  }
+</script>
+
+</body>
+</html>
