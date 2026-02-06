@@ -462,66 +462,47 @@ app.post('/auth/dev-login', (req, res) => {
 
 
 app.post(ROUTES.SESSION_CREATE, async (req, res) => {
-  const { classId, materialId } = req.body;
+const { classId, materialId } = req.body;
 
-  if (!classId || typeof classId !== "string" || classId.trim() === "") {
-    return sendHttpError(
-      res,
-      400,
-      ERRORS.PAYLOAD_INVALID,
-      "MISSING_CLASS_ID"
-    );
+if (!classId || typeof classId !== "string" || classId.trim() === "") {
+  return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "MISSING_CLASS_ID");
+}
 
-  }
+// ✅ classId DB 검증 (RDB 기준으로 유효한 class만 세션 생성 허용)
+const foundClass = await prisma.class.findUnique({
+  where: { id: classId.trim() },
+  select: { id: true },
+});
 
-    // ✅ classId DB 검증 (RDB 기준으로 유효한 class만 세션 생성 허용)
-  const foundClass = await prisma.class.findUnique({
-    where: { id: classId.trim() },
-    select: { id: true },
+if (!foundClass) {
+  return sendHttpError(res, 404, ERRORS.CLASS_NOT_FOUND, "CLASS_NOT_FOUND");
+}
+
+// ✅ materialId가 있으면 DB 검증 (선택)
+let normalizedMaterialId = null;
+
+if (
+  materialId !== undefined &&
+  materialId !== null &&
+  typeof materialId === "string" &&
+  materialId.trim() !== ""
+) {
+  normalizedMaterialId = materialId.trim();
+
+  const foundMaterial = await prisma.material.findUnique({
+    where: { id: normalizedMaterialId },
+    select: { id: true, classId: true },
   });
 
-  if (!foundClass) {
-    return sendHttpError(
-      res,
-      404,
-      ERRORS.CLASS_NOT_FOUND,
-      "CLASS_NOT_FOUND"
-    );
+  if (!foundMaterial) {
+    return sendHttpError(res, 404, ERRORS.MATERIAL_NOT_FOUND, "MATERIAL_NOT_FOUND");
   }
 
-    // ✅ materialId가 있으면 DB 검증 (선택)
-  let normalizedMaterialId = null;
+  if (foundMaterial.classId !== classId.trim()) {
+    return sendHttpError(res, 400, ERRORS.MATERIAL_CLASS_MISMATCH, "MATERIAL_CLASS_MISMATCH");
+  }
+}
 
-  if (
-    materialId !== undefined &&
-    materialId !== null &&
-    typeof materialId === "string" &&
-    materialId.trim() !== ""
-  ) {
-    normalizedMaterialId = materialId.trim();
-
-    const foundMaterial = await prisma.material.findUnique({
-      where: { id: normalizedMaterialId },
-      select: { id: true, classId: true },
-    });
-
-    if (!foundMaterial) {
-      return sendHttpError(
-        res,
-        404,
-        ERRORS.MATERIAL_NOT_FOUND,
-        "MATERIAL_NOT_FOUND"
-      );
-    }
-
-    if (foundMaterial.classId !== classId.trim()) {
-      return sendHttpError(
-        res,
-        400,
-        ERRORS.MATERIAL_CLASS_MISMATCH,
-        "MATERIAL_CLASS_MISMATCH"
-      );
-    }
   }
 
   const sessionId = uuidv4();
@@ -535,16 +516,19 @@ app.post(ROUTES.SESSION_CREATE, async (req, res) => {
 
   await sessionStore.create(sessionId, sessionData);
 
-  logger.info("session created", { sessionId, classId: sessionData.classId });
-  
-  const baseUrl = `${req.protocol}://${req.get("host")}`;
+logger.info("session created", { sessionId, classId: sessionData.classId });
 
-  res.json({
-    sessionId,
-    materialId: sessionData.materialId,
-    joinUrlTeacher: `${baseUrl}/?sessionId=${sessionId}`,
-    joinUrlStudent: `${baseUrl}/?sessionId=${sessionId}`,
-  });
+const clientOrigin =
+  process.env.CLIENT_ORIGIN || APP_CONFIG.CORS_ORIGIN || "http://localhost:5173";
+const ttlSeconds = Number(process.env.SESSION_TTL_SECONDS || 21600);
+
+res.json({
+  sessionId,
+  materialId: sessionData.materialId,
+  joinUrlTeacher: `${clientOrigin}/?sessionId=${sessionId}&role=teacher`,
+  joinUrlStudent: `${clientOrigin}/?sessionId=${sessionId}&role=student`,
+  ttlSeconds,
+});
 });
 
 
@@ -553,25 +537,30 @@ app.post(ROUTES.SESSION_CREATE, async (req, res) => {
  */
 io.on('connection', (socket) => {
 
-  logger.info("socket connected", {
-    socketId: socket.id,
-    userId: socket.data.userId,
-    role: socket.data.role,
-  });
-  socket.currentRoom = null;
+logger.info("socket connected", {
+  socketId: socket.id,
+  userId: socket.data.userId,
+  role: socket.data.role,
+});
 
-  // ✅ join-room
-  socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
-   logger.info("join room requested",{
+socket.currentRoom = null;
+
+// ✅ join-room
+socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
+  logger.info("join room requested", {
     socketId: socket.id,
     role: socket.data.role,
     roomId,
-   });
+  });
 
-    if (!roomId) {
-      socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.MISSING_ROOM_ID, message: "roomId is required" });
-      return;
-    }
+  if (!roomId) {
+    socket.emit(SOCKET_EVENTS.ERROR, {
+      code: ERRORS.MISSING_ROOM_ID,
+      message: "roomId is required",
+    });
+    return;
+  }
+
 
     const session = await sessionStore.get(roomId);
     if (!session) {
