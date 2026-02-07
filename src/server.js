@@ -503,8 +503,6 @@ if (
   }
 }
 
-  }
-
   const sessionId = uuidv4();
 
   const sessionData = {
