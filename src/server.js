@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const { logger } = require("./utils/logger");
 const { ERRORS } = require("../config/errors");
 const { sendHttpError } = require("./utils/httpError");
@@ -5,7 +7,6 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 
-require('dotenv').config();
 if (process.env.NODE_ENV !== "production") {
   logger.info("env loaded", { key: "REDIS_URL" });
 }
@@ -22,6 +23,7 @@ const sessionStore = require('./store/sessionStore');
 const { signToken, verifyToken } = require('./utils/jwt');
 const { pubClient, subClient } = require("./lib/redisPubSub");
 const MAX_MESSAGE_LEN = 300;
+const VALID_DRAW_TYPES = new Set(["ds", "dm", "de", "un", "er"]);
 
 
 
@@ -36,6 +38,15 @@ function isValidMessage(msg) {
   return true;
 }
 
+
+// room별 draw tick 카운터 (순서 보장용)
+const roomDrawTick = new Map();
+
+function getNextTick(roomName) {
+  const t = (roomDrawTick.get(roomName) || 0) + 1;
+  roomDrawTick.set(roomName, t);
+  return t;
+}
 
 // ✅ 가드 헬퍼 함수
 function requireTeacher(socket) {
@@ -735,9 +746,98 @@ socket.on(SOCKET_EVENTS.SEND_MESSAGE, async (payload) => {
   });
 });
 
+socket.on(SOCKET_EVENTS.DRAW_EVENT, (payload) => {
+  if (!requireJoined(socket)) {
+    return socket.emit(SOCKET_EVENTS.ERROR, {
+      code: ERRORS.NOT_JOINED,
+      message: "NOT_JOINED",
+    });
+  }
+
+  if (!payload || !VALID_DRAW_TYPES.has(payload.e)) {
+    return socket.emit(SOCKET_EVENTS.ERROR, {
+      code: ERRORS.PAYLOAD_INVALID,
+      message: "INVALID_DRAW_EVENT",
+    });
+  }
+
+  const roomId = payload.r || socket.data.roomId;
+  if (roomId !== socket.data.roomId) {
+    return socket.emit(SOCKET_EVENTS.ERROR, {
+      code: ERRORS.PAYLOAD_INVALID,
+      message: "ROOM_MISMATCH",
+    });
+  }
+
+  const { e } = payload;
+
+  if (e === "ds") {
+    if (typeof payload.sId !== "number" ||
+        typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
+        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
+        typeof payload.c !== "string" || !payload.c ||
+        typeof payload.w !== "number" || payload.w <= 0) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DS_PAYLOAD",
+      });
+    }
+  }
+
+  if (e === "dm") {
+    if (typeof payload.sId !== "number" ||
+        typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
+        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1) {
+      return; // drop: 고빈도 이벤트이므로 에러 응답 생략
+    }
+  }
+
+  if (e === "de") {
+    if (typeof payload.sId !== "number") {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DE_PAYLOAD",
+      });
+    }
+    if (payload.pts !== undefined) {
+      if (!Array.isArray(payload.pts)) {
+        return socket.emit(SOCKET_EVENTS.ERROR, {
+          code: ERRORS.PAYLOAD_INVALID,
+          message: "INVALID_DE_PAYLOAD",
+        });
+      }
+    }
+  }
+
+  if (e === "un" || e === "er") {
+    if (typeof payload.sId !== "number") {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: e === "un" ? "INVALID_UN_PAYLOAD" : "INVALID_ER_PAYLOAD",
+      });
+    }
+  }
+
+  socket.to(socket.currentRoom).emit(SOCKET_EVENTS.DRAW_EVENT, {
+    ...payload,
+    senderUserId: socket.data.userId,
+    senderRole: socket.data.role,
+    t: getNextTick(socket.currentRoom),
+    ts: Date.now(),
+  });
+});
+
+
   // ✅ disconnect
   socket.on("disconnect", () => {
     logger.info("socket disconnected", { socketId: socket.id });
+    // room에 아무도 없으면 tick 카운터 정리
+    if (socket.currentRoom) {
+      const room = io.sockets.adapter.rooms.get(socket.currentRoom);
+      if (!room || room.size === 0) {
+        roomDrawTick.delete(socket.currentRoom);
+      }
+    }
   });
 });
 

@@ -59,20 +59,20 @@ socket.on('connect', () => {
   log(`서버 연결됨 (role=${role})`);
 });
 
-socket.on('receive-message', (msg) => {
-  log('💬 채팅: ' + msg);
+socket.on('receive_message', (data) => {
+  log('💬 채팅: ' + data.message + ' (' + data.sender.userId + ')');
 });
 
-socket.on('receive-dm', (data) => {
-  log('📢 DM: ' + data.message);
+socket.on('receive_dm', (data) => {
+  log('📢 DM: ' + data.message + ' (from: ' + data.senderUserId + ')');
 });
 
-  socket.on('join-success', (data) => {
+  socket.on('join_success', (data) => {
     showSuccess('✅ 입장 성공: ' + data.roomId);
     log('✅ 입장 성공: ' + data.roomId);
   });
 
-  socket.on('server-error', (err) => {
+  socket.on('server_error', (err) => {
     if (err.code === 'SESSION_NOT_FOUND') {
       showError('❌ 입장 거부: 존재하지 않는 세션입니다.');
       log('❌ 입장 거부: 존재하지 않는 세션');
@@ -94,14 +94,14 @@ socket.on('receive-dm', (data) => {
 
   const roomId = document.getElementById('roomId').value;
 
-  socket.emit('join-room', { roomId });
+  socket.emit('join_room', { roomId });
   log('방 입장 시도: ' + roomId);
 }
 
   function sendMsg() {
   const msg = document.getElementById('msg').value;
 
-  socket.emit('send-message', { msg });
+  socket.emit('send_message', { message: msg });
 
   // ✅ 내 화면에는 즉시 '보냄' 표시
   log('보냄(채팅): ' + msg);
@@ -110,7 +110,7 @@ socket.on('receive-dm', (data) => {
 
   function sendDM() {
     const message = document.getElementById('msg').value;
-    socket.emit('teacher-send-dm', { message });
+    socket.emit('teacher_send_dm', { message });
     log('📤 DM 전송: ' + message);
   }
 
