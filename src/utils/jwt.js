@@ -7,7 +7,12 @@ function signToken(payload) {
 }
 
 function verifyToken(token) {
-  return jwt.verify(token, process.env.JWT_SECRET);
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch (e) {
+    console.log("JWT_VERIFY_FAIL:", e.name, e.message);
+    throw e;
+  }
 }
 
 module.exports = { signToken, verifyToken };
