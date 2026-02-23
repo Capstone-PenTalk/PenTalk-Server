@@ -160,6 +160,14 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ✅ #30: 교사 role 검증 미들웨어 (requireAuth 이후에 사용)
+function requireTeacherRole(req, res, next) {
+  if (req.role !== "teacher") {
+    return sendHttpError(res, 403, ERRORS.FORBIDDEN, "TEACHER_ONLY");
+  }
+  next();
+}
+
 // ✅ #29: class 멤버십 검증 미들웨어
 async function requireClassMember(req, res, next) {
   const classId = (req.query.classId || "").toString().trim();
@@ -298,9 +306,99 @@ app.delete("/subjects/:subjectId", async (req, res) => {
   }
 });
 
+// ✅ #30: Tag CRUD
+async function getTagOr404(tagId, res) {
+  const tag = await prisma.tag.findUnique({ where: { id: tagId } });
+  if (!tag) {
+    sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "TAG_NOT_FOUND");
+    return null;
+  }
+  return tag;
+}
+
+app.post("/tags", requireAuth, requireTeacherRole, async (req, res) => {
+  const { name } = req.body;
+
+  if (!name || typeof name !== "string" || !name.trim()) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "INVALID_TAG_NAME");
+  }
+
+  try {
+    const tag = await prisma.tag.create({ data: { name: name.trim() } });
+    return res.status(201).json(tag);
+  } catch (err) {
+    if (err?.code === "P2002") {
+      return sendHttpError(res, 409, ERRORS.PAYLOAD_INVALID, "DUPLICATE_TAG");
+    }
+    logger.error("tag create failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.get("/tags", requireAuth, async (req, res) => {
+  try {
+    const tags = await prisma.tag.findMany({ orderBy: { name: "asc" } });
+    return res.json(tags);
+  } catch (err) {
+    logger.error("tags list failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.get("/tags/:tagId", requireAuth, async (req, res) => {
+  const { tagId } = req.params;
+  try {
+    const tag = await prisma.tag.findUnique({ where: { id: tagId } });
+    if (!tag) return sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "TAG_NOT_FOUND");
+    return res.json(tag);
+  } catch (err) {
+    logger.error("tag get failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.put("/tags/:tagId", requireAuth, requireTeacherRole, async (req, res) => {
+  const { tagId } = req.params;
+  const { name } = req.body;
+
+  if (!name || typeof name !== "string" || !name.trim()) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "INVALID_TAG_NAME");
+  }
+
+  try {
+    const tag = await getTagOr404(tagId, res);
+    if (!tag) return;
+
+    const updated = await prisma.tag.update({
+      where: { id: tagId },
+      data: { name: name.trim() },
+    });
+    return res.json(updated);
+  } catch (err) {
+    if (err?.code === "P2002") {
+      return sendHttpError(res, 409, ERRORS.PAYLOAD_INVALID, "DUPLICATE_TAG");
+    }
+    logger.error("tag update failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.delete("/tags/:tagId", requireAuth, requireTeacherRole, async (req, res) => {
+  const { tagId } = req.params;
+  try {
+    const tag = await getTagOr404(tagId, res);
+    if (!tag) return;
+
+    await prisma.tag.delete({ where: { id: tagId } });
+    return res.json({ ok: true, tagId });
+  } catch (err) {
+    logger.error("tag delete failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
 /**
- * ✅ Day11: materials 검색/필터링 리스트 API (schema.prisma 기준)
- * GET /materials?classId=&subjectId=&keyword=
+ * GET /materials?classId=&subjectId=&tagId=&keyword=
  *
  * - classId: 필수
  * - subjectId: 선택 (MaterialSubject 조인 필터)
@@ -313,6 +411,7 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
   try {
     const classId = (req.query.classId || "").toString().trim();
     const subjectId = (req.query.subjectId || "").toString().trim();
+    const tagId = (req.query.tagId || "").toString().trim();
     const keyword = (req.query.keyword || "").toString().trim();
 
     // 2) where 구성 (Material 기준)
@@ -326,6 +425,13 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       };
     }
 
+    // tag 필터: MaterialTag 조인 테이블을 통해 필터링
+    if (tagId) {
+      where.MaterialTag = {
+        some: { tagId },
+      };
+    }
+
     // keyword 검색: schema에 title/description이 없어서
     // 임시로 type/url에서만 검색(필요하면 Material에 title 같은 필드 추가 권장)
     if (keyword && keyword.length >= 2) {
@@ -335,7 +441,7 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       ];
     }
 
-    // 3) 조회 + subject 이름까지 포함
+    // 3) 조회 + subject/tag 이름까지 포함
     const items = await prisma.material.findMany({
       where,
       orderBy: { createdAt: "desc" },
@@ -343,6 +449,11 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
         subjects: {
           include: {
             subject: { select: { id: true, name: true } },
+          },
+        },
+        MaterialTag: {
+          include: {
+            Tag: { select: { id: true, name: true } },
           },
         },
       },
@@ -359,6 +470,10 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       subjects: (m.subjects || []).map((ms) => ({
         id: ms.subject.id,
         name: ms.subject.name,
+      })),
+      tags: (m.MaterialTag || []).map((mt) => ({
+        id: mt.Tag.id,
+        name: mt.Tag.name,
       })),
     }));
 
@@ -480,6 +595,102 @@ app.delete("/materials/:materialId/subjects/:subjectId", async (req, res) => {
     return res.json({ ok: true, materialId, subjectId });
   } catch (err) {
     logger.error("material subject delete failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+// ✅ #30: MaterialTag 엔드포인트
+app.post("/materials/:materialId/tags", requireAuth, async (req, res) => {
+  const { materialId } = req.params;
+  const { tagIds } = req.body;
+
+  if (!Array.isArray(tagIds) || tagIds.length === 0) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "INVALID_TAG_IDS");
+  }
+
+  const uniqueIds = [...new Set(tagIds.map((x) => String(x).trim()).filter(Boolean))];
+  if (uniqueIds.length === 0) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "INVALID_TAG_IDS");
+  }
+
+  try {
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { id: true },
+    });
+    if (!material) {
+      return sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "MATERIAL_NOT_FOUND");
+    }
+
+    const found = await prisma.tag.findMany({
+      where: { id: { in: uniqueIds } },
+      select: { id: true },
+    });
+    if (found.length !== uniqueIds.length) {
+      return sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "TAG_NOT_FOUND");
+    }
+
+    await prisma.materialTag.createMany({
+      data: uniqueIds.map((tagId) => ({ materialId, tagId })),
+      skipDuplicates: true,
+    });
+
+    const mapped = await prisma.materialTag.findMany({
+      where: { materialId },
+      include: { Tag: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    return res.json({
+      materialId,
+      tags: mapped.map((m) => m.Tag),
+    });
+  } catch (err) {
+    logger.error("material tag add failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.get("/materials/:materialId/tags", requireAuth, async (req, res) => {
+  const { materialId } = req.params;
+
+  try {
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { id: true },
+    });
+    if (!material) {
+      return sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "MATERIAL_NOT_FOUND");
+    }
+
+    const mapped = await prisma.materialTag.findMany({
+      where: { materialId },
+      include: { Tag: true },
+      orderBy: { createdAt: "asc" },
+    });
+
+    return res.json(mapped.map((m) => m.Tag));
+  } catch (err) {
+    logger.error("material tag list failed", { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+});
+
+app.delete("/materials/:materialId/tags/:tagId", requireAuth, async (req, res) => {
+  const { materialId, tagId } = req.params;
+
+  try {
+    const deleted = await prisma.materialTag.deleteMany({
+      where: { materialId, tagId },
+    });
+
+    if (deleted.count === 0) {
+      return sendHttpError(res, 404, ERRORS.PAYLOAD_INVALID, "MAPPING_NOT_FOUND");
+    }
+
+    return res.json({ ok: true, materialId, tagId });
+  } catch (err) {
+    logger.error("material tag delete failed", { err: err?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
   }
 });
