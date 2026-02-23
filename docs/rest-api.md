@@ -5,11 +5,18 @@
 ### Base URL
 - 개발: `http://localhost:4000`
 
+### 인증
+일부 엔드포인트는 JWT 토큰이 필요합니다. `POST /auth/dev-login`으로 토큰을 발급받아 헤더에 포함합니다.
+
+```
+Authorization: Bearer <token>
+```
+
 ### Error Response (통일 포맷)
 ```json
 {
-  "code": "PAYLOAD_INVALID",
-  "message": "MISSING_CLASS_ID"
+  "code": "ERROR_CODE",
+  "message": "ERROR_MESSAGE"
 }
 ```
 
@@ -72,23 +79,35 @@
 |------|------|---------|
 | 400 | PAYLOAD_INVALID | MISSING_CLASS_ID |
 
-📄 GET /materials — 수업 자료 조회 (검색/필터링)
+---
 
+## GET /materials
+
+### 목적
 반(class) 기준으로 수업 자료(Material)를 조회한다.
 과목(subject) 및 키워드(keyword) 필터를 선택적으로 적용할 수 있다.
 
-✅ Request
-GET /materials?classId=&subjectId=&keyword=
+> **인증 필요** — `Authorization: Bearer <token>` 헤더 필수
+> 토큰의 userId가 해당 class의 ClassMember에 존재해야 한다.
 
-Query Parameters
-이름	필수	설명
-classId	O	반(Class) ID
-subjectId	X	과목(Subject) ID
-keyword	X	검색 키워드 (type, url 기준 부분 검색)
+### Query Parameters
 
-classId가 없을 경우 요청은 거부된다.
+| 이름 | 필수 | 설명 |
+|------|------|------|
+| classId | O | 반(Class) ID |
+| subjectId | X | 과목(Subject) ID |
+| keyword | X | 검색 키워드 (type, url 기준 부분 검색) |
 
-✅ Response (200 OK)
+### Request 예시
+```
+GET /materials?classId=CLASS_ID
+GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID
+GET /materials?classId=CLASS_ID&keyword=pdf
+GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
+```
+
+### Response 200
+```json
 {
   "items": [
     {
@@ -107,46 +126,23 @@ classId가 없을 경우 요청은 거부된다.
   ],
   "count": 1
 }
+```
 
+- `items`: 조건에 맞는 material 목록 (최대 50개, 최신순)
+- `count`: 반환된 결과 개수
+- `subjects`: material에 연결된 과목 목록
 
-items: 조건에 맞는 material 목록
+### Errors
+| HTTP | code | message | 설명 |
+|------|------|---------|------|
+| 400 | PAYLOAD_INVALID | MISSING_CLASS_ID | classId 누락 |
+| 401 | UNAUTHORIZED | MISSING_TOKEN | Authorization 헤더 없음 |
+| 401 | UNAUTHORIZED | INVALID_TOKEN | 토큰 검증 실패 |
+| 401 | UNAUTHORIZED | INVALID_TOKEN_PAYLOAD | 토큰 payload 이상 |
+| 403 | FORBIDDEN | NOT_CLASS_MEMBER | 해당 반의 멤버가 아님 |
+| 500 | INTERNAL_ERROR | INTERNAL_ERROR | 서버 오류 |
 
-count: 전체 결과 개수
-
-subjects: material에 연결된 과목 목록 (태그 형태로 프론트 사용 가능)
-
-❌ Error Responses
-400 Bad Request — classId 누락
-{
-  "code": "MISSING_CLASS_ID",
-  "message": "classId is required",
-  "items": [],
-  "count": 0
-}
-
-500 Internal Server Error
-{
-  "code": "INTERNAL_ERROR",
-  "message": "failed to fetch materials"
-}
-
-🔍 필터 조합 예시
-# classId 기준 조회
-GET /materials?classId=CLASS_ID
-
-# classId + subjectId
-GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID
-
-# classId + keyword
-GET /materials?classId=CLASS_ID&keyword=pdf
-
-# classId + subjectId + keyword
-GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
-
-⚙️ Performance Note
-
-classId 기준 조회는 ("classId","createdAt") 복합 인덱스를 사용
-
-subjectId 필터는 MaterialSubject(subjectId, materialId) 인덱스를 사용
-
-EXPLAIN ANALYZE 기준 실행 시간은 약 0.3ms로 확인됨
+### Performance Note
+- `(classId, createdAt)` 복합 인덱스로 반별 최신순 조회 최적화
+- `MaterialSubject(subjectId, materialId)` 인덱스로 과목 필터 최적화
+- EXPLAIN ANALYZE 기준 실행 시간 약 0.3ms
