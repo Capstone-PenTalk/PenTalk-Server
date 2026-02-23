@@ -96,14 +96,16 @@ Authorization: Bearer <token>
 |------|------|------|
 | classId | O | 반(Class) ID |
 | subjectId | X | 과목(Subject) ID |
+| tagId | X | 태그(Tag) ID |
 | keyword | X | 검색 키워드 (type, url 기준 부분 검색) |
 
 ### Request 예시
 ```
 GET /materials?classId=CLASS_ID
 GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID
+GET /materials?classId=CLASS_ID&tagId=TAG_ID
 GET /materials?classId=CLASS_ID&keyword=pdf
-GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
+GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&tagId=TAG_ID&keyword=sample
 ```
 
 ### Response 200
@@ -117,10 +119,10 @@ GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
       "classId": "cml3irfbx0002uvtjvazqiv3z",
       "createdAt": "2026-02-02T06:30:29.605Z",
       "subjects": [
-        {
-          "id": "b3cb5b75-4655-4be9-b1b5-fb051464b4e9",
-          "name": "Math"
-        }
+        { "id": "SUBJECT_ID", "name": "Math" }
+      ],
+      "tags": [
+        { "id": "TAG_ID", "name": "중요" }
       ]
     }
   ],
@@ -131,6 +133,7 @@ GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
 - `items`: 조건에 맞는 material 목록 (최대 50개, 최신순)
 - `count`: 반환된 결과 개수
 - `subjects`: material에 연결된 과목 목록
+- `tags`: material에 연결된 태그 목록
 
 ### Errors
 | HTTP | code | message | 설명 |
@@ -145,4 +148,174 @@ GET /materials?classId=CLASS_ID&subjectId=SUBJECT_ID&keyword=sample
 ### Performance Note
 - `(classId, createdAt)` 복합 인덱스로 반별 최신순 조회 최적화
 - `MaterialSubject(subjectId, materialId)` 인덱스로 과목 필터 최적화
+- `MaterialTag(tagId, materialId)` 인덱스로 태그 필터 최적화
 - EXPLAIN ANALYZE 기준 실행 시간 약 0.3ms
+
+---
+
+## Tag API
+
+### 설계 결정 사항
+
+- Subject는 **과목(교육과정 단위)** 태그로, Material에만 연결됩니다 (Class 연결 없음).
+- Tag는 **자유 형식 다중 태그**로, Subject와 독립적으로 Material에 부여할 수 있습니다.
+- 두 태그 체계를 분리하여 확장성을 확보합니다.
+
+---
+
+## POST /tags
+
+### 목적
+새 태그를 생성한다. **교사만 가능.**
+
+### Request Body
+```json
+{ "name": "중요" }
+```
+
+### Response 201
+```json
+{ "id": "TAG_ID", "name": "중요", "createdAt": "..." }
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 400 | PAYLOAD_INVALID | INVALID_TAG_NAME |
+| 409 | PAYLOAD_INVALID | DUPLICATE_TAG |
+
+---
+
+## GET /tags
+
+### 목적
+전체 태그 목록을 이름 오름차순으로 반환한다. **인증 필요 (교사/학생 모두 가능).**
+
+### Response 200
+```json
+[
+  { "id": "TAG_ID", "name": "중요", "createdAt": "..." }
+]
+```
+
+---
+
+## GET /tags/:tagId
+
+### Response 200
+```json
+{ "id": "TAG_ID", "name": "중요", "createdAt": "..." }
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 404 | PAYLOAD_INVALID | TAG_NOT_FOUND |
+
+---
+
+## GET /tags/:tagId
+
+> **인증 필요 (교사/학생 모두 가능)**
+
+## PUT /tags/:tagId
+
+> **교사만 가능**
+
+### Request Body
+```json
+{ "name": "매우중요" }
+```
+
+### Response 200
+```json
+{ "id": "TAG_ID", "name": "매우중요", "createdAt": "..." }
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 400 | PAYLOAD_INVALID | INVALID_TAG_NAME |
+| 404 | PAYLOAD_INVALID | TAG_NOT_FOUND |
+| 409 | PAYLOAD_INVALID | DUPLICATE_TAG |
+
+---
+
+## DELETE /tags/:tagId
+
+> **교사만 가능**
+
+### Response 200
+```json
+{ "ok": true, "tagId": "TAG_ID" }
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 404 | PAYLOAD_INVALID | TAG_NOT_FOUND |
+
+---
+
+## POST /materials/:materialId/tags
+
+### 목적
+수업자료에 태그를 추가한다. 여러 개를 한 번에 추가 가능하며, 중복은 무시된다.
+
+### Request Body
+```json
+{ "tagIds": ["TAG_ID_1", "TAG_ID_2"] }
+```
+
+### Response 200
+```json
+{
+  "materialId": "MATERIAL_ID",
+  "tags": [
+    { "id": "TAG_ID_1", "name": "중요", "createdAt": "..." }
+  ]
+}
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 400 | PAYLOAD_INVALID | INVALID_TAG_IDS |
+| 404 | PAYLOAD_INVALID | MATERIAL_NOT_FOUND |
+| 404 | PAYLOAD_INVALID | TAG_NOT_FOUND |
+
+---
+
+## GET /materials/:materialId/tags
+
+### 목적
+수업자료에 연결된 태그 목록을 반환한다.
+
+### Response 200
+```json
+[
+  { "id": "TAG_ID", "name": "중요", "createdAt": "..." }
+]
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 404 | PAYLOAD_INVALID | MATERIAL_NOT_FOUND |
+
+---
+
+## DELETE /materials/:materialId/tags/:tagId
+
+### 목적
+수업자료에서 태그를 제거한다.
+
+### Response 200
+```json
+{ "ok": true, "materialId": "MATERIAL_ID", "tagId": "TAG_ID" }
+```
+
+### Errors
+| HTTP | code | message |
+|------|------|---------|
+| 404 | PAYLOAD_INVALID | MAPPING_NOT_FOUND |
