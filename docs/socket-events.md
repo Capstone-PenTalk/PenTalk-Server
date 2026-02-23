@@ -266,3 +266,45 @@
 - `NOT_JOINED` - room 미참여
 - `PAYLOAD_INVALID` - 잘못된 payload
 - `ROOM_MISMATCH` - payload.r이 현재 room과 불일치
+
+---
+
+## draw_snapshot
+
+### Server -> Client (join 성공 직후 1회)
+
+- Event: `draw_snapshot`
+- 목적: 재접속/새로고침 시 기존 판서 상태 복원
+
+### Payload
+```json
+{
+  "strokes": [
+    {
+      "sId": 1706745600000,
+      "x": 0.1,
+      "y": 0.2,
+      "c": "#FF0000",
+      "w": 3,
+      "pts": [
+        { "x": 0.1, "y": 0.2 },
+        { "x": 0.15, "y": 0.25 }
+      ]
+    }
+  ]
+}
+```
+
+- `strokes`: 현재 room의 완성된 stroke 목록 (빈 배열이면 신규 입장)
+- 각 stroke는 `de` 수신 시 저장된 최종 상태 (dm 좌표 제외)
+- `un`/`er`로 삭제된 stroke는 포함되지 않음
+
+### 저장 구조
+- Redis Hash: `whiteboard:{sessionId}`
+- field: strokeId(string), value: stroke JSON
+- TTL: 세션과 동일 (`SESSION_TTL_SECONDS`)
+
+### 클라이언트 처리 순서
+1. `join_success` 수신
+2. `draw_snapshot` 수신 → 캔버스 초기화 후 strokes 전체 렌더링
+3. 이후 `draw_event` 실시간 이벤트 적용
