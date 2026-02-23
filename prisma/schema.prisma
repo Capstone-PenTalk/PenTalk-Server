@@ -8,31 +8,83 @@ datasource db {
 }
 
 model User {
-  id        String   @id @default(cuid())
-  name      String?
-  role      String
-  createdAt DateTime @default(now())
-
-  classes   Class[]  @relation("TeacherClasses")
+  id          String        @id @default(cuid())
+  name        String?
+  role        String
+  createdAt   DateTime      @default(now())
+  classes     Class[]       @relation("TeacherClasses")
+  ClassMember ClassMember[]
 }
 
 model Class {
-  id        String   @id @default(cuid())
-  title     String
-  createdAt DateTime @default(now())
-
-  teacherId String
-  teacher   User     @relation("TeacherClasses", fields: [teacherId], references: [id], onDelete: Restrict)
-
-  materials Material[]
+  id          String        @id @default(cuid())
+  title       String
+  createdAt   DateTime      @default(now())
+  teacherId   String
+  teacher     User          @relation("TeacherClasses", fields: [teacherId], references: [id])
+  ClassMember ClassMember[]
+  materials   Material[]
 }
 
 model Material {
-  id        String   @id @default(cuid())
-  type      String
-  url       String
-  createdAt DateTime @default(now())
+  id              String            @id @default(cuid())
+  type            String
+  url             String
+  createdAt       DateTime          @default(now())
+  classId         String
+  class           Class             @relation(fields: [classId], references: [id], onDelete: Cascade)
+  MaterialSubject MaterialSubject[]
+  MaterialTag     MaterialTag[]
 
-  classId   String
-  class     Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  @@index([classId, createdAt])
+}
+
+model ClassMember {
+  id          String   @id
+  createdAt   DateTime @default(now())
+  roleInClass String   @default("student")
+  userId      String
+  classId     String
+  Class       Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  User        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([classId, userId])
+}
+
+model MaterialSubject {
+  id         String   @id
+  createdAt  DateTime @default(now())
+  materialId String
+  subjectId  String
+  Material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  Subject    Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@unique([materialId, subjectId])
+  @@index([subjectId, materialId])
+}
+
+model MaterialTag {
+  id         String   @id
+  createdAt  DateTime @default(now())
+  materialId String
+  tagId      String
+  Material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  Tag        Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([materialId, tagId])
+  @@index([tagId, materialId])
+}
+
+model Subject {
+  id              String            @id
+  name            String            @unique
+  createdAt       DateTime          @default(now())
+  MaterialSubject MaterialSubject[]
+}
+
+model Tag {
+  id          String        @id
+  name        String        @unique
+  createdAt   DateTime      @default(now())
+  MaterialTag MaterialTag[]
 }
