@@ -22,8 +22,13 @@ const { ROUTES } = require('../config/routes');
 const sessionStore = require('./store/sessionStore');
 const { signToken, verifyToken } = require('./utils/jwt');
 const { pubClient, subClient } = require("./lib/redisPubSub");
+const redis = require("./lib/redis");
 const MAX_MESSAGE_LEN = 300;
 const VALID_DRAW_TYPES = new Set(["ds", "dm", "de", "un", "er"]);
+
+// ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
+// Map<sessionId, Map<sId, {sId, x, y, c, w}>>
+const pendingStrokes = new Map();
 
 
 
@@ -880,6 +885,17 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       classId: session.classId,
       user: { userId: socket.data.userId, role: socket.data.role }
     });
+
+    // ✅ #74: join 직후 whiteboard snapshot 전송 (재접속 복원)
+    try {
+      const wbKey = `whiteboard:${roomId}`;
+      const raw = await redis.hgetall(wbKey);
+      const strokes = raw ? Object.values(raw).map((v) => JSON.parse(v)) : [];
+      socket.emit(SOCKET_EVENTS.DRAW_SNAPSHOT, { strokes });
+      logger.info("draw_snapshot sent", { roomId, count: strokes.length });
+    } catch (err) {
+      logger.error("draw_snapshot failed", { err: err?.message });
+    }
   });
 
 
@@ -991,7 +1007,7 @@ socket.on(SOCKET_EVENTS.SEND_MESSAGE, async (payload) => {
   });
 });
 
-socket.on(SOCKET_EVENTS.DRAW_EVENT, (payload) => {
+socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
   if (!requireJoined(socket)) {
     return socket.emit(SOCKET_EVENTS.ERROR, {
       code: ERRORS.NOT_JOINED,
@@ -1027,6 +1043,12 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, (payload) => {
         message: "INVALID_DS_PAYLOAD",
       });
     }
+    // ✅ #74: ds 데이터를 pendingStrokes에 임시 보관 (de 완성 시 Redis 저장에 사용)
+    const sid = socket.data.roomId;
+    if (!pendingStrokes.has(sid)) pendingStrokes.set(sid, new Map());
+    pendingStrokes.get(sid).set(payload.sId, {
+      sId: payload.sId, x: payload.x, y: payload.y, c: payload.c, w: payload.w,
+    });
   }
 
   if (e === "dm") {
@@ -1070,17 +1092,48 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, (payload) => {
     t: getNextTick(socket.currentRoom),
     ts: Date.now(),
   });
+
+  // ✅ #74: whiteboard 저장소 갱신 (브로드캐스트 후 비동기 처리)
+  const sessionId = socket.data.roomId;
+  const wbKey = `whiteboard:${sessionId}`;
+
+  try {
+    if (e === "de") {
+      // ds에서 보관한 색상/굵기/시작점과 병합하여 최종 stroke 저장
+      const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
+      const stroke = {
+        sId: payload.sId,
+        x: dsData?.x ?? 0,
+        y: dsData?.y ?? 0,
+        c: dsData?.c ?? "#000000",
+        w: dsData?.w ?? 2,
+        pts: Array.isArray(payload.pts) ? payload.pts : [],
+      };
+      await redis.hset(wbKey, String(payload.sId), JSON.stringify(stroke));
+      await redis.expire(wbKey, APP_CONFIG.SESSION_TTL_SECONDS);
+      pendingStrokes.get(sessionId)?.delete(payload.sId);
+    }
+
+    if (e === "un" || e === "er") {
+      // strokeId 기준으로 저장소에서 삭제
+      await redis.hdel(wbKey, String(payload.sId));
+      pendingStrokes.get(sessionId)?.delete(payload.sId);
+    }
+  } catch (err) {
+    logger.error("whiteboard store update failed", { e, err: err?.message });
+  }
 });
 
 
   // ✅ disconnect
   socket.on("disconnect", () => {
     logger.info("socket disconnected", { socketId: socket.id });
-    // room에 아무도 없으면 tick 카운터 정리
+    // room에 아무도 없으면 tick 카운터 및 pendingStrokes 정리
     if (socket.currentRoom) {
       const room = io.sockets.adapter.rooms.get(socket.currentRoom);
       if (!room || room.size === 0) {
         roomDrawTick.delete(socket.currentRoom);
+        pendingStrokes.delete(socket.data.roomId);
       }
     }
   });

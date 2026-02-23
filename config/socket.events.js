@@ -8,6 +8,7 @@ const SOCKET_EVENTS = {
   RECEIVE_MESSAGE: 'receive_message',
   ERROR: 'server_error',
   DRAW_EVENT: 'draw_event',
+  DRAW_SNAPSHOT: 'draw_snapshot',
 };
 
 module.exports = { SOCKET_EVENTS };
