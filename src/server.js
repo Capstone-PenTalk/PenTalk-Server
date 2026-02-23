@@ -127,6 +127,54 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(APP_CONFIG.STATIC_DIR));
 
+// ✅ #29: HTTP 인증 미들웨어
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const [type, token] = auth.split(" ");
+
+  if (type !== "Bearer" || !token) {
+    return sendHttpError(res, 401, ERRORS.UNAUTHORIZED, "MISSING_TOKEN");
+  }
+
+  try {
+    const payload = verifyToken(token);
+    if (!payload?.userId) {
+      return sendHttpError(res, 401, ERRORS.UNAUTHORIZED, "INVALID_TOKEN_PAYLOAD");
+    }
+    req.userId = payload.userId;
+    req.role = payload.role;
+    next();
+  } catch (e) {
+    return sendHttpError(res, 401, ERRORS.UNAUTHORIZED, "INVALID_TOKEN");
+  }
+}
+
+// ✅ #29: class 멤버십 검증 미들웨어
+async function requireClassMember(req, res, next) {
+  const classId = (req.query.classId || "").toString().trim();
+
+  if (!classId) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "MISSING_CLASS_ID");
+  }
+
+  try {
+    const membership = await prisma.classMember.findFirst({
+      where: { classId, userId: req.userId },
+      select: { id: true, roleInClass: true },
+    });
+
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
+    }
+
+    req.roleInClass = membership.roleInClass;
+    next();
+  } catch (e) {
+    logger.error("requireClassMember failed", { err: e?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
+  }
+}
+
 app.post("/subjects", async (req, res) => {
   const { name } = req.body;
 
@@ -250,25 +298,11 @@ app.delete("/subjects/:subjectId", async (req, res) => {
  * 응답:
  * { items: [{ id,type,url,classId,createdAt,subjects:[{id,name}]}], count }
  */
-app.get("/materials", async (req, res) => {
-
-  console.log(">>> HIT /materials", req.query);
-
-
+app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
   try {
     const classId = (req.query.classId || "").toString().trim();
     const subjectId = (req.query.subjectId || "").toString().trim();
     const keyword = (req.query.keyword || "").toString().trim();
-
-    // 1) validation
-    if (!classId) {
-      return res.status(400).json({
-        code: "MISSING_CLASS_ID",
-        message: "classId is required",
-        items: [],
-        count: 0,
-      });
-    }
 
     // 2) where 구성 (Material 기준)
     /** @type {any} */
@@ -502,8 +536,6 @@ if (
     return sendHttpError(res, 400, ERRORS.MATERIAL_CLASS_MISMATCH, "MATERIAL_CLASS_MISMATCH");
   }
 }
-
-  }
 
   const sessionId = uuidv4();
 
