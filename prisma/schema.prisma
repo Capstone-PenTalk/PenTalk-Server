@@ -40,7 +40,7 @@ model Material {
 }
 
 model ClassMember {
-  id          String   @id
+  id          String   @id @default(cuid())
   createdAt   DateTime @default(now())
   roleInClass String   @default("student")
   userId      String
@@ -52,7 +52,7 @@ model ClassMember {
 }
 
 model MaterialSubject {
-  id         String   @id
+  id         String   @id @default(cuid())
   createdAt  DateTime @default(now())
   materialId String
   subjectId  String
@@ -64,7 +64,7 @@ model MaterialSubject {
 }
 
 model MaterialTag {
-  id         String   @id
+  id         String   @id @default(cuid())
   createdAt  DateTime @default(now())
   materialId String
   tagId      String
@@ -76,14 +76,14 @@ model MaterialTag {
 }
 
 model Subject {
-  id              String            @id
+  id              String            @id @default(cuid())
   name            String            @unique
   createdAt       DateTime          @default(now())
   MaterialSubject MaterialSubject[]
 }
 
 model Tag {
-  id          String        @id
+  id          String        @id @default(cuid())
   name        String        @unique
   createdAt   DateTime      @default(now())
   MaterialTag MaterialTag[]
