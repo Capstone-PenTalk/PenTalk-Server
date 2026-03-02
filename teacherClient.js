@@ -24,7 +24,7 @@ socket.on("join_success", (data) => {
 
   // ds: draw_start
   setTimeout(() => {
-    socket.emit("draw_event", {
+    socket.emit("draw:append", {
       e: "ds",
       sId: strokeId,
       x: 0.1,
@@ -43,7 +43,7 @@ socket.on("join_success", (data) => {
   ];
   points.forEach((pt, i) => {
     setTimeout(() => {
-      socket.emit("draw_event", {
+      socket.emit("draw:append", {
         e: "dm",
         sId: strokeId,
         x: pt.x,
@@ -55,7 +55,7 @@ socket.on("join_success", (data) => {
 
   // de: draw_end
   setTimeout(() => {
-    socket.emit("draw_event", {
+    socket.emit("draw:append", {
       e: "de",
       sId: strokeId,
       pts: [
@@ -70,14 +70,14 @@ socket.on("join_success", (data) => {
 
   // un: undo
   setTimeout(() => {
-    socket.emit("draw_event", { e: "un", sId: strokeId });
+    socket.emit("draw:clear", { e: "un", sId: strokeId });
     console.log("[teacher] un emitted, sId:", strokeId);
   }, 1000);
 
   // er: eraser
   const eraserStrokeId = Date.now() + 1;
   setTimeout(() => {
-    socket.emit("draw_event", { e: "er", sId: eraserStrokeId });
+    socket.emit("draw:clear", { e: "er", sId: eraserStrokeId });
     console.log("[teacher] er emitted, sId:", eraserStrokeId);
   }, 1200);
 
@@ -88,8 +88,12 @@ socket.on("join_success", (data) => {
   }, 1500);
 });
 
-socket.on("draw_event", (payload) => {
-  console.log("[teacher] received draw_event:", payload);
+socket.on("draw:append", (payload) => {
+  console.log("[teacher] received draw:append:", payload);
+});
+
+socket.on("draw:clear", (payload) => {
+  console.log("[teacher] received draw:clear:", payload);
 });
 
 socket.on("server_error", (e) => {

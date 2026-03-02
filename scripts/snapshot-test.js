@@ -26,9 +26,9 @@ async function run() {
     teacher.on("connect", () => teacher.emit("join_room", { roomId: sessionId }));
     teacher.on("join_success", () => {
       console.log("[TEACHER] join_success");
-      teacher.emit("draw_event", { e: "ds", sId: 99991, x: 0.1, y: 0.2, c: "#FF0000", w: 3 });
-      teacher.emit("draw_event", { e: "dm", sId: 99991, x: 0.15, y: 0.25 });
-      teacher.emit("draw_event", {
+      teacher.emit("draw:append", { e: "ds", sId: 99991, x: 0.1, y: 0.2, c: "#FF0000", w: 3 });
+      teacher.emit("draw:append", { e: "dm", sId: 99991, x: 0.15, y: 0.25 });
+      teacher.emit("draw:append", {
         e: "de", sId: 99991,
         pts: [{ x: 0.1, y: 0.2 }, { x: 0.15, y: 0.25 }, { x: 0.2, y: 0.3 }],
       });
@@ -40,14 +40,17 @@ async function run() {
   });
   teacher.disconnect();
 
-  // 3) 학생이 재접속 → draw_snapshot 수신 확인
+  // 3) 학생이 재접속 → sync:request 전송 → sync:state 수신 확인
   const student = makeSocket(studentToken);
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("TIMEOUT")), 4000);
     student.on("connect", () => student.emit("join_room", { roomId: sessionId }));
-    student.on("draw_snapshot", (data) => {
+    student.on("join_success", () => {
+      student.emit("sync:request");
+    });
+    student.on("sync:state", (data) => {
       clearTimeout(t);
-      console.log(`[STUDENT] draw_snapshot 수신 ✅  strokes: ${data.strokes.length}개`);
+      console.log(`[STUDENT] sync:state 수신 ✅  strokes: ${data.strokes.length}개`);
       const s = data.strokes[0];
       console.log(`  sId:${s?.sId}  c:${s?.c}  w:${s?.w}  pts:${s?.pts?.length}개`);
       resolve();

@@ -24,7 +24,7 @@ const { signToken, verifyToken } = require('./utils/jwt');
 const { pubClient, subClient } = require("./lib/redisPubSub");
 const redis = require("./lib/redis");
 const MAX_MESSAGE_LEN = 300;
-const VALID_DRAW_TYPES = new Set(["ds", "dm", "de", "un", "er"]);
+const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
 // Map<sessionId, Map<sId, {sId, x, y, c, w}>>
@@ -78,7 +78,7 @@ subClient.psubscribe("dm-channel:*", (err, count) => {
   logger.info("📡redis psubscribed", { pattern: "dm-channel:*", count });
 });
 
-// 2) 메시지 수신 → 해당 room(sessionId)로 브로드캐스트
+// 2) 메시지 수신 → 학생 룸으로만 브로드캐스트
 subClient.on("pmessage", (pattern, channel, message) => {
   try {
     // channel 예: dm-channel:abc123
@@ -87,20 +87,20 @@ subClient.on("pmessage", (pattern, channel, message) => {
 
     const payload = JSON.parse(message);
 
-    const roomName = `${APP_CONFIG.SESSION_PREFIX}${sessionId}`;
-    
+    const studentsRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:students`;
+
     const senderSocketId = payload?.senderSocketId;
 
     if (senderSocketId && io.sockets.sockets.has(senderSocketId)) {
-      io.to(roomName).except(senderSocketId).emit(SOCKET_EVENTS.RECEIVE_DM, payload);
+      io.to(studentsRoom).except(senderSocketId).emit(SOCKET_EVENTS.RECEIVE_DM, payload);
     } else {
-      io.to(roomName).emit(SOCKET_EVENTS.RECEIVE_DM, payload);
+      io.to(studentsRoom).emit(SOCKET_EVENTS.RECEIVE_DM, payload);
     }
 
     logger.info("📨pubsub dm broadcast", {
     channel,
     channelSessionId: sessionId,
-    roomName,
+    studentsRoom,
     fromUserId: payload?.senderUserId,
     senderSocketId: payload?.senderSocketId,
   });
@@ -863,21 +863,28 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     }
 
 
-    const newRoom = `${APP_CONFIG.SESSION_PREFIX}${roomId}`;
+    const studentsRoom = `${APP_CONFIG.SESSION_PREFIX}${roomId}:students`;
+    const teachersRoom = `${APP_CONFIG.SESSION_PREFIX}${roomId}:teachers`;
+    const roleRoom = socket.data.role === "teacher" ? teachersRoom : studentsRoom;
 
     if (socket.currentRoom) socket.leave(socket.currentRoom);
 
-    socket.join(newRoom);
-    socket.currentRoom = newRoom;
+    socket.join(roleRoom);
+    socket.currentRoom = roleRoom;
     socket.data.roomId = roomId;
-
-    // ✅ 추가: 세션에서 classId 주입
     socket.data.classId = session.classId;
+    socket.data.studentsRoom = studentsRoom;
+    socket.data.teachersRoom = teachersRoom;
+    socket.data.roleRoom = roleRoom;
 
-    logger.info("✅join room success",{
+    logger.info("✅join room success", {
       socketId: socket.id,
-      roomId: newRoom,
-      classId: session.classId,
+      userId: socket.data.userId,
+      role: socket.data.role,
+      roomId,
+      joinedRoom: roleRoom,
+      studentsRoom,
+      teachersRoom,
     });
 
     socket.emit(SOCKET_EVENTS.JOIN_SUCCESS, {
@@ -886,15 +893,30 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       user: { userId: socket.data.userId, role: socket.data.role }
     });
 
-    // ✅ #74: join 직후 whiteboard snapshot 전송 (재접속 복원)
+  });
+
+  // ✅ sync:request (재접속 시 명시적 판서 상태 요청 → sync:state 응답)
+  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async () => {
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.NOT_JOINED,
+        message: "NOT_JOINED",
+      });
+    }
+
+    const roomId = socket.data.roomId;
     try {
       const wbKey = `whiteboard:${roomId}`;
       const raw = await redis.hgetall(wbKey);
       const strokes = raw ? Object.values(raw).map((v) => JSON.parse(v)) : [];
-      socket.emit(SOCKET_EVENTS.DRAW_SNAPSHOT, { strokes });
-      logger.info("draw_snapshot sent", { roomId, count: strokes.length });
+      socket.emit(SOCKET_EVENTS.SYNC_STATE, { strokes });
+      logger.info("sync:state sent", { roomId, count: strokes.length });
     } catch (err) {
-      logger.error("draw_snapshot failed", { err: err?.message });
+      logger.error("sync:state failed", { err: err?.message });
+      socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.INTERNAL_ERROR,
+        message: "SYNC_FAILED",
+      });
     }
   });
 
@@ -996,18 +1018,27 @@ socket.on(SOCKET_EVENTS.SEND_MESSAGE, async (payload) => {
 
   }
 
-  // 4) 브로드캐스트 (객체)
-  socket.to(socket.currentRoom).emit(SOCKET_EVENTS.RECEIVE_MESSAGE, {
+  // 4) 브로드캐스트 — 교사/학생 양쪽 룸으로 전송 (크로스룸 채팅 유지)
+  const chatPayload = {
     message: message.trim(),
     sender: {
       userId: socket.data.userId,
       role: socket.data.role,
     },
     ts: Date.now(),
-  });
+  };
+  socket.to(socket.data.studentsRoom).to(socket.data.teachersRoom).emit(SOCKET_EVENTS.RECEIVE_MESSAGE, chatPayload);
 });
 
-socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
+// ✅ draw:append (ds: 시작, dm: 스트리밍, de: 종료)
+socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
+  if (!requireTeacher(socket)) {
+    return socket.emit(SOCKET_EVENTS.ERROR, {
+      code: ERRORS.FORBIDDEN,
+      message: "TEACHER_ONLY",
+    });
+  }
+
   if (!requireJoined(socket)) {
     return socket.emit(SOCKET_EVENTS.ERROR, {
       code: ERRORS.NOT_JOINED,
@@ -1015,10 +1046,10 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
     });
   }
 
-  if (!payload || !VALID_DRAW_TYPES.has(payload.e)) {
+  if (!payload || !VALID_DRAW_APPEND_TYPES.has(payload.e)) {
     return socket.emit(SOCKET_EVENTS.ERROR, {
       code: ERRORS.PAYLOAD_INVALID,
-      message: "INVALID_DRAW_EVENT",
+      message: "INVALID_DRAW_APPEND_EVENT",
     });
   }
 
@@ -1054,7 +1085,8 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
   if (e === "dm") {
     if (typeof payload.sId !== "number" ||
         typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
-        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1) {
+        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
+        (payload.p !== undefined && (typeof payload.p !== "number" || payload.p < 0 || payload.p > 1))) {
       return; // drop: 고빈도 이벤트이므로 에러 응답 생략
     }
   }
@@ -1066,40 +1098,35 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
         message: "INVALID_DE_PAYLOAD",
       });
     }
-    if (payload.pts !== undefined) {
-      if (!Array.isArray(payload.pts)) {
-        return socket.emit(SOCKET_EVENTS.ERROR, {
-          code: ERRORS.PAYLOAD_INVALID,
-          message: "INVALID_DE_PAYLOAD",
-        });
-      }
-    }
-  }
-
-  if (e === "un" || e === "er") {
-    if (typeof payload.sId !== "number") {
+    if (payload.pts !== undefined && !Array.isArray(payload.pts)) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
-        message: e === "un" ? "INVALID_UN_PAYLOAD" : "INVALID_ER_PAYLOAD",
+        message: "INVALID_DE_PAYLOAD",
       });
     }
   }
 
-  socket.to(socket.currentRoom).emit(SOCKET_EVENTS.DRAW_EVENT, {
+  socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
     ...payload,
     senderUserId: socket.data.userId,
     senderRole: socket.data.role,
-    t: getNextTick(socket.currentRoom),
+    t: getNextTick(socket.data.studentsRoom),
     ts: Date.now(),
   });
 
-  // ✅ #74: whiteboard 저장소 갱신 (브로드캐스트 후 비동기 처리)
-  const sessionId = socket.data.roomId;
-  const wbKey = `whiteboard:${sessionId}`;
+  logger.info("📐draw:append broadcast", {
+    fromUserId: socket.data.userId,
+    roomId: socket.data.roomId,
+    studentsRoom: socket.data.studentsRoom,
+    e: payload.e,
+    sId: payload.sId,
+  });
 
-  try {
-    if (e === "de") {
-      // ds에서 보관한 색상/굵기/시작점과 병합하여 최종 stroke 저장
+  // ✅ #74: de 시 whiteboard Redis 저장
+  if (e === "de") {
+    const sessionId = socket.data.roomId;
+    const wbKey = `whiteboard:${sessionId}`;
+    try {
       const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
       const stroke = {
         sId: payload.sId,
@@ -1112,27 +1139,64 @@ socket.on(SOCKET_EVENTS.DRAW_EVENT, async (payload) => {
       await redis.hset(wbKey, String(payload.sId), JSON.stringify(stroke));
       await redis.expire(wbKey, APP_CONFIG.SESSION_TTL_SECONDS);
       pendingStrokes.get(sessionId)?.delete(payload.sId);
+    } catch (err) {
+      logger.error("whiteboard store update failed", { e, err: err?.message });
     }
-
-    if (e === "un" || e === "er") {
-      // strokeId 기준으로 저장소에서 삭제
-      await redis.hdel(wbKey, String(payload.sId));
-      pendingStrokes.get(sessionId)?.delete(payload.sId);
-    }
-  } catch (err) {
-    logger.error("whiteboard store update failed", { e, err: err?.message });
   }
 });
 
 
+  // ✅ draw:clear (un: 실행취소, er: 지우개)
+  socket.on(SOCKET_EVENTS.DRAW_CLEAR, async (payload) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.FORBIDDEN,
+        message: "TEACHER_ONLY",
+      });
+    }
+
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.NOT_JOINED,
+        message: "NOT_JOINED",
+      });
+    }
+
+    if (!payload || typeof payload.sId !== "number" ||
+        (payload.e !== "un" && payload.e !== "er")) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
+
+    socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_CLEAR, {
+      e: payload.e,
+      sId: payload.sId,
+      senderUserId: socket.data.userId,
+      t: getNextTick(socket.data.studentsRoom),
+      ts: Date.now(),
+    });
+
+    const sessionId = socket.data.roomId;
+    const wbKey = `whiteboard:${sessionId}`;
+    try {
+      await redis.hdel(wbKey, String(payload.sId));
+      pendingStrokes.get(sessionId)?.delete(payload.sId);
+    } catch (err) {
+      logger.error("whiteboard clear failed", { err: err?.message });
+    }
+  });
+
   // ✅ disconnect
   socket.on("disconnect", () => {
     logger.info("socket disconnected", { socketId: socket.id });
-    // room에 아무도 없으면 tick 카운터 및 pendingStrokes 정리
-    if (socket.currentRoom) {
-      const room = io.sockets.adapter.rooms.get(socket.currentRoom);
-      if (!room || room.size === 0) {
-        roomDrawTick.delete(socket.currentRoom);
+    // studentsRoom이 비면 tick 카운터 및 pendingStrokes 정리
+    const studentsRoom = socket.data?.studentsRoom;
+    if (studentsRoom) {
+      const sRoom = io.sockets.adapter.rooms.get(studentsRoom);
+      if (!sRoom || sRoom.size === 0) {
+        roomDrawTick.delete(studentsRoom);
         pendingStrokes.delete(socket.data.roomId);
       }
     }
