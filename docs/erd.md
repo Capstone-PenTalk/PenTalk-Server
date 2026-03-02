@@ -4,7 +4,7 @@
 erDiagram
     User {
         String id PK
-        String name
+        String name "nullable"
         String role
         DateTime createdAt
     }
@@ -20,7 +20,7 @@ erDiagram
         String id PK
         String userId FK
         String classId FK
-        String roleInClass
+        String roleInClass "default: student"
         DateTime createdAt
     }
 
@@ -34,7 +34,7 @@ erDiagram
 
     Subject {
         String id PK
-        String name
+        String name "unique"
         DateTime createdAt
     }
 
@@ -47,7 +47,7 @@ erDiagram
 
     Tag {
         String id PK
-        String name
+        String name "unique"
         DateTime createdAt
     }
 
@@ -60,12 +60,12 @@ erDiagram
 
     User ||--o{ Class : "teaches (teacherId)"
     User ||--o{ ClassMember : "belongs to"
-    Class ||--o{ ClassMember : "has"
-    Class ||--o{ Material : "contains"
-    Material ||--o{ MaterialSubject : "has"
-    Subject ||--o{ MaterialSubject : "tagged to"
-    Material ||--o{ MaterialTag : "has"
-    Tag ||--o{ MaterialTag : "tagged to"
+    Class ||--o{ ClassMember : "has (cascade delete)"
+    Class ||--o{ Material : "contains (cascade delete)"
+    Material ||--o{ MaterialSubject : "has (cascade delete)"
+    Subject ||--o{ MaterialSubject : "tagged to (cascade delete)"
+    Material ||--o{ MaterialTag : "has (cascade delete)"
+    Tag ||--o{ MaterialTag : "tagged to (cascade delete)"
 ```
 
 ## 관계 설명
@@ -78,6 +78,16 @@ erDiagram
 | Material ↔ Subject (MaterialSubject) | N:M | 수업자료에 여러 과목 태그 가능 |
 | Material ↔ Tag (MaterialTag) | N:M | 수업자료에 여러 태그 가능 |
 
+## 제약 조건
+
+| 테이블 | 제약 | 설명 |
+|--------|------|------|
+| ClassMember | `UNIQUE (classId, userId)` | 동일 반에 중복 멤버 방지 |
+| MaterialSubject | `UNIQUE (materialId, subjectId)` | 동일 과목 중복 연결 방지 |
+| MaterialTag | `UNIQUE (materialId, tagId)` | 동일 태그 중복 연결 방지 |
+| Subject | `UNIQUE (name)` | 과목명 중복 방지 |
+| Tag | `UNIQUE (name)` | 태그명 중복 방지 |
+
 ## 인덱스
 
 | 테이블 | 인덱스 | 목적 |
@@ -85,4 +95,13 @@ erDiagram
 | Material | `(classId, createdAt)` | 반별 최신순 조회 최적화 |
 | MaterialSubject | `(subjectId, materialId)` | 과목 기준 필터링 최적화 |
 | MaterialTag | `(tagId, materialId)` | 태그 기준 필터링 최적화 |
-| ClassMember | `UNIQUE (classId, userId)` | 중복 멤버 방지 |
+
+## Cascade Delete 규칙
+
+| 부모 삭제 시 | 연쇄 삭제 대상 |
+|-------------|---------------|
+| Class 삭제 | ClassMember, Material |
+| Material 삭제 | MaterialSubject, MaterialTag |
+| Subject 삭제 | MaterialSubject |
+| Tag 삭제 | MaterialTag |
+| User 삭제 | ClassMember |
