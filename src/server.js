@@ -116,22 +116,48 @@ io.use((socket, next) => {
     const token = socket.handshake.auth?.token;
 
     if (!token) {
-      return next(new Error("UNAUTHORIZED")); // 토큰 없음
+      logger.warn("socket auth failed", { reason: "NO_TOKEN", socketId: socket.id });
+      return next(new Error("UNAUTHORIZED"));
     }
 
     const payload = verifyToken(token); // { userId, role }
 
     if (!payload?.userId || !payload?.role) {
-      return next(new Error("UNAUTHORIZED")); // payload 이상
+      logger.warn("socket auth failed", {
+        reason: "INVALID_PAYLOAD",
+        socketId: socket.id,
+        payload,
+      });
+      return next(new Error("UNAUTHORIZED"));
+    }
+
+    if (!['teacher', 'student'].includes(payload.role)) {
+      logger.warn("socket auth failed", {
+        reason: "INVALID_ROLE",
+        socketId: socket.id,
+        userId: payload.userId,
+        role: payload.role,
+      });
+      return next(new Error("UNAUTHORIZED"));
     }
 
     // ✅ JWT에서만 가져옴
     socket.data.userId = payload.userId;
     socket.data.role = payload.role;
 
+    logger.info("socket authenticated", {
+      socketId: socket.id,
+      userId: payload.userId,
+      role: payload.role,
+    });
+
     return next();
   } catch (err) {
-    return next(new Error("UNAUTHORIZED")); // 토큰 검증 실패
+    logger.error("socket auth error", {
+      socketId: socket.id,
+      error: err.message,
+    });
+    return next(new Error("UNAUTHORIZED"));
   }
 });
 
@@ -905,6 +931,13 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     }
 
     const roomId = socket.data.roomId;
+    logger.info("sync:request received", {
+      socketId: socket.id,
+      userId: socket.data.userId,
+      role: socket.data.role,
+      roomId,
+    });
+
     try {
       const wbKey = `whiteboard:${roomId}`;
       const raw = await redis.hgetall(wbKey);
