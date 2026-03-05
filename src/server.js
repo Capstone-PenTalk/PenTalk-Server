@@ -35,6 +35,38 @@ const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 // Map<sessionId, Map<sId, {sId, x, y, c, w}>>
 const pendingStrokes = new Map();
 
+// ✅ #38: presence 자료구조 (sessionId -> Map(userKey -> socketId))
+const presenceBySession = new Map();
+
+function userKeyOf(socket) {
+  return `${socket.data.role}:${socket.data.userId}`;
+}
+
+function getSessionPresence(roomId) {
+  let m = presenceBySession.get(roomId);
+  if (!m) {
+    m = new Map();
+    presenceBySession.set(roomId, m);
+  }
+  return m;
+}
+
+function buildPresenceList(roomId) {
+  const m = presenceBySession.get(roomId);
+  if (!m) return [];
+  return Array.from(m.keys()).map((k) => {
+    const [role, userId] = k.split(":");
+    return { userId, role };
+  });
+}
+
+function getRoleRooms(roomId) {
+  return {
+    studentsRoom: `${APP_CONFIG.SESSION_PREFIX}${roomId}:students`,
+    teachersRoom: `${APP_CONFIG.SESSION_PREFIX}${roomId}:teachers`,
+  };
+}
+
 
 
 function isValidMessage(msg) {
@@ -1078,6 +1110,35 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       user: { userId: socket.data.userId, role: socket.data.role }
     });
 
+    // ✅ #38: presence 입장 처리
+    const sessionPresence = getSessionPresence(roomId);
+    const meKey = userKeyOf(socket);
+
+    // 중복 접속 처리: 같은 userId+role이 이미 접속 중이면 기존 소켓 끊기
+    const existingSocketId = sessionPresence.get(meKey);
+    if (existingSocketId && existingSocketId !== socket.id) {
+      const oldSocket = io.sockets.sockets.get(existingSocketId);
+      if (oldSocket) oldSocket.disconnect(true);
+      sessionPresence.delete(meKey);
+    }
+
+    // 현재 소켓 등록
+    sessionPresence.set(meKey, socket.id);
+
+    // 본인에게 현재 접속자 목록 전달
+    socket.emit(SOCKET_EVENTS.PRESENCE_STATE, {
+      roomId,
+      users: buildPresenceList(roomId),
+    });
+
+    // 같은 세션의 학생/교사 룸 전체에 입장 브로드캐스트 (본인 제외)
+    const { studentsRoom: sRoom, teachersRoom: tRoom } = getRoleRooms(roomId);
+    socket.to(sRoom).to(tRoom).emit(SOCKET_EVENTS.PRESENCE_JOIN, {
+      roomId,
+      userId: socket.data.userId,
+      role: socket.data.role,
+    });
+
   });
 
   // ✅ sync:request (재접속 시 명시적 판서 상태 요청 → sync:state 응답)
@@ -1412,6 +1473,32 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       pendingStrokes.get(sessionId)?.delete(payload.sId);
     } catch (err) {
       logger.error("whiteboard clear failed", { err: err?.message });
+    }
+  });
+
+  // ✅ #38: disconnecting - 룸이 비워지기 전에 presence:leave 브로드캐스트
+  socket.on("disconnecting", (reason) => {
+    const roomId = socket.data.roomId;
+    if (!roomId) return;
+
+    const sessionPresence = presenceBySession.get(roomId);
+    if (!sessionPresence) return;
+
+    const meKey = userKeyOf(socket);
+    const existingSocketId = sessionPresence.get(meKey);
+
+    // 현재 끊기는 소켓이 등록된 소켓일 때만 제거 (중복 접속 race 방어)
+    if (existingSocketId === socket.id) {
+      sessionPresence.delete(meKey);
+      if (sessionPresence.size === 0) presenceBySession.delete(roomId);
+
+      const { studentsRoom: sRoom, teachersRoom: tRoom } = getRoleRooms(roomId);
+      socket.to(sRoom).to(tRoom).emit(SOCKET_EVENTS.PRESENCE_LEAVE, {
+        roomId,
+        userId: socket.data.userId,
+        role: socket.data.role,
+        reason,
+      });
     }
   });
 
