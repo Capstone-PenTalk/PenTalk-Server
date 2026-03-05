@@ -1,10 +1,15 @@
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
+
 const { logger } = require("./utils/logger");
 const { ERRORS } = require("../config/errors");
 const { sendHttpError } = require("./utils/httpError");
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+
+const WHITEBOARD_DIR = path.join(__dirname, '..', 'storage', 'whiteboards');
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -43,6 +48,37 @@ function isValidMessage(msg) {
   return true;
 }
 
+
+// ✅ #34: whiteboard 분산 락 (SET NX PX)
+const WB_LOCK_TTL_MS = 2000;
+const WB_LOCK_RETRY_DELAY_MS = 25;
+const WB_LOCK_MAX_RETRIES = 10;
+// 락 해제: 자신이 건 락만 삭제 (Lua 원자적 실행)
+const WB_LOCK_RELEASE_SCRIPT = `
+  if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+  else
+    return 0
+  end`;
+
+async function withWhiteboardLock(sessionId, fn) {
+  const lockKey = `lock:whiteboard:${sessionId}`;
+  const lockValue = uuidv4();
+  for (let attempt = 0; attempt <= WB_LOCK_MAX_RETRIES; attempt++) {
+    const acquired = await redis.set(lockKey, lockValue, "NX", "PX", WB_LOCK_TTL_MS);
+    if (acquired) {
+      try {
+        return await fn();
+      } finally {
+        await redis.eval(WB_LOCK_RELEASE_SCRIPT, 1, lockKey, lockValue);
+      }
+    }
+    if (attempt < WB_LOCK_MAX_RETRIES) {
+      await new Promise((r) => setTimeout(r, WB_LOCK_RETRY_DELAY_MS));
+    }
+  }
+  throw new Error(`whiteboard lock timeout sessionId=${sessionId}`);
+}
 
 // room별 draw tick 카운터 (순서 보장용)
 const roomDrawTick = new Map();
@@ -727,6 +763,129 @@ app.delete("/materials/:materialId/tags/:tagId", requireAuth, async (req, res) =
 });
 
 
+// ✅ #34: 세션 종료 API
+app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    // 1. Idempotent: 이미 ARCHIVED면 기존 결과 반환
+    const existing = await prisma.session.findUnique({ where: { id: sessionId } });
+    if (existing?.status === 'ARCHIVED') {
+      return res.json({
+        ok: true,
+        sessionId,
+        status: 'ARCHIVED',
+        drawingPath: existing.drawingPath,
+        closedAt: existing.closedAt,
+      });
+    }
+
+    // 2. Redis에서 세션 조회
+    const session = await sessionStore.get(sessionId);
+    if (!session) {
+      return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "SESSION_NOT_FOUND");
+    }
+
+    // 3. JWT classId == session.classId 검증 (교사가 해당 클래스 멤버인지 확인)
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
+    }
+
+    // 4. DB 상태: ACTIVE → CLOSING
+    await prisma.session.upsert({
+      where: { id: sessionId },
+      create: {
+        id: sessionId,
+        classId: session.classId,
+        materialId: session.materialId || null,
+        status: 'CLOSING',
+        endAttempts: 1,
+      },
+      update: {
+        status: 'CLOSING',
+        endAttempts: { increment: 1 },
+        endError: null,
+      },
+    });
+
+    // 5. Redis에서 판서 데이터 수집 (락으로 스냅샷 일관성 보장)
+    const wbKey = `whiteboard:${sessionId}`;
+    let strokes = [];
+    await withWhiteboardLock(sessionId, async () => {
+      const raw = await redis.get(wbKey);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+        } catch (e) {
+          logger.warn("invalid whiteboard json in redis", { sessionId, err: e?.message });
+        }
+      }
+    });
+    const whiteboardData = { strokes };
+
+    // 6. Atomic file write: tmp → rename
+    await fs.promises.mkdir(WHITEBOARD_DIR, { recursive: true });
+    const filePath = path.join(WHITEBOARD_DIR, `${sessionId}.json`);
+    const tmpPath = `${filePath}.tmp`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(whiteboardData), 'utf8');
+    await fs.promises.rename(tmpPath, filePath);
+
+    // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
+    await redis.expire(wbKey, APP_CONFIG.WHITEBOARD_TTL_AFTER_END);
+
+    // 8. DB 상태: CLOSING → ARCHIVED
+    const closedAt = new Date();
+    await prisma.session.update({
+      where: { id: sessionId },
+      data: {
+        status: 'ARCHIVED',
+        drawingPath: filePath,
+        closedAt,
+        endError: null,
+      },
+    });
+
+    // 9. Socket session:ended 브로드캐스트
+    const studentsRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:students`;
+    const teachersRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:teachers`;
+    io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
+      sessionId,
+      endedAt: closedAt.getTime(),
+    });
+
+    logger.info("✅ session ended", {
+      sessionId,
+      classId: session.classId,
+      strokeCount: strokes.length,
+      drawingPath: filePath,
+    });
+
+    return res.json({
+      ok: true,
+      sessionId,
+      status: 'ARCHIVED',
+      strokeCount: strokes.length,
+      drawingPath: filePath,
+      closedAt,
+    });
+  } catch (err) {
+    logger.error("session end failed", { sessionId, err: err?.message });
+    // 실패 시 endError 기록 (CLOSING 상태로 남아있을 수 있음)
+    try {
+      await prisma.session.updateMany({
+        where: { id: sessionId, status: 'CLOSING' },
+        data: { status: 'FAILED', endError: err?.message ?? 'UNKNOWN' },
+      });
+    } catch (_) { /* DB 기록 실패는 무시 */ }
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "SESSION_END_FAILED");
+  }
+});
+
 const PORT = process.env.PORT || APP_CONFIG.PORT;
 
 app.post('/auth/dev-login', (req, res) => {
@@ -940,8 +1099,16 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
     try {
       const wbKey = `whiteboard:${roomId}`;
-      const raw = await redis.hgetall(wbKey);
-      const strokes = raw ? Object.values(raw).map((v) => JSON.parse(v)) : [];
+      const raw = await redis.get(wbKey);
+      let strokes = [];
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+        } catch (e) {
+          logger.warn("invalid whiteboard json on sync", { roomId, err: e?.message });
+        }
+      }
       socket.emit(SOCKET_EVENTS.SYNC_STATE, { strokes });
       logger.info("sync:state sent", { roomId, count: strokes.length });
     } catch (err) {
@@ -1155,13 +1322,13 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     sId: payload.sId,
   });
 
-  // ✅ #74: de 시 whiteboard Redis 저장
+  // ✅ #74: de 시 whiteboard Redis 저장 (string/JSON: { strokes: [...] })
   if (e === "de") {
     const sessionId = socket.data.roomId;
     const wbKey = `whiteboard:${sessionId}`;
     try {
       const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
-      const stroke = {
+      const newStroke = {
         sId: payload.sId,
         x: dsData?.x ?? 0,
         y: dsData?.y ?? 0,
@@ -1169,8 +1336,23 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         w: dsData?.w ?? 2,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
       };
-      await redis.hset(wbKey, String(payload.sId), JSON.stringify(stroke));
-      await redis.expire(wbKey, APP_CONFIG.SESSION_TTL_SECONDS);
+
+      // 락 획득 후 GET → parse → upsert → SET (원자적 보장)
+      await withWhiteboardLock(sessionId, async () => {
+        const raw = await redis.get(wbKey);
+        let strokes = [];
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+          } catch (_) { /* 깨진 데이터면 빈 배열로 초기화 */ }
+        }
+        const idx = strokes.findIndex((s) => s.sId === payload.sId);
+        if (idx >= 0) strokes[idx] = newStroke;
+        else strokes.push(newStroke);
+        await redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS);
+      });
+
       pendingStrokes.get(sessionId)?.delete(payload.sId);
     } catch (err) {
       logger.error("whiteboard store update failed", { e, err: err?.message });
@@ -1214,7 +1396,19 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     const sessionId = socket.data.roomId;
     const wbKey = `whiteboard:${sessionId}`;
     try {
-      await redis.hdel(wbKey, String(payload.sId));
+      // 락 획득 후 GET → parse → filter → SET (원자적 보장)
+      await withWhiteboardLock(sessionId, async () => {
+        const raw = await redis.get(wbKey);
+        let strokes = [];
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+          } catch (_) { /* 깨진 데이터면 빈 배열 */ }
+        }
+        strokes = strokes.filter((s) => s.sId !== payload.sId);
+        await redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS);
+      });
       pendingStrokes.get(sessionId)?.delete(payload.sId);
     } catch (err) {
       logger.error("whiteboard clear failed", { err: err?.message });
