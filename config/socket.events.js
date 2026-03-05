@@ -11,6 +11,9 @@ const SOCKET_EVENTS = {
   SYNC_REQUEST: 'sync:request',
   SYNC_STATE: 'sync:state',
   SESSION_ENDED: 'session:ended',
+  PRESENCE_JOIN: 'presence:join',
+  PRESENCE_LEAVE: 'presence:leave',
+  PRESENCE_STATE: 'presence:state',
 };
 
 module.exports = { SOCKET_EVENTS };
