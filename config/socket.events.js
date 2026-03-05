@@ -10,6 +10,7 @@ const SOCKET_EVENTS = {
   DRAW_CLEAR: 'draw:clear',
   SYNC_REQUEST: 'sync:request',
   SYNC_STATE: 'sync:state',
+  SESSION_ENDED: 'session:ended',
 };
 
 module.exports = { SOCKET_EVENTS };

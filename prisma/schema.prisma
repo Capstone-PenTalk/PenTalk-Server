@@ -7,6 +7,13 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum SessionStatus {
+  ACTIVE
+  CLOSING
+  ARCHIVED
+  FAILED
+}
+
 model User {
   id          String        @id @default(cuid())
   name        String?
@@ -24,6 +31,7 @@ model Class {
   teacher     User          @relation("TeacherClasses", fields: [teacherId], references: [id])
   ClassMember ClassMember[]
   materials   Material[]
+  sessions    Session[]
 }
 
 model Material {
@@ -35,6 +43,7 @@ model Material {
   class           Class             @relation(fields: [classId], references: [id], onDelete: Cascade)
   MaterialSubject MaterialSubject[]
   MaterialTag     MaterialTag[]
+  sessions        Session[]
 
   @@index([classId, createdAt])
 }
@@ -87,4 +96,21 @@ model Tag {
   name        String        @unique
   createdAt   DateTime      @default(now())
   MaterialTag MaterialTag[]
+}
+
+model Session {
+  id          String        @id @default(cuid())
+  classId     String
+  class       Class         @relation(fields: [classId], references: [id], onDelete: Cascade)
+  materialId  String?
+  material    Material?     @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  status      SessionStatus @default(ACTIVE)
+  drawingPath String?
+  closedAt    DateTime?
+  endAttempts Int           @default(0)
+  endError    String?
+  createdAt   DateTime      @default(now())
+
+  @@index([classId, createdAt])
+  @@index([status])
 }
