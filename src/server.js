@@ -888,6 +888,9 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
       endedAt: closedAt.getTime(),
+      reason: "SESSION_ENDED_BY_TEACHER",
+      endedBy: req.userId,
+      message: "교사가 수업을 종료했습니다",
     });
 
     logger.info("✅ session ended", {
@@ -1041,6 +1044,13 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     const session = await sessionStore.get(roomId);
     if (!session) {
       socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_NOT_FOUND, message: "Session not found" });
+      return;
+    }
+
+    // ✅ #39: 종료된 세션 재입장 차단
+    const dbSession = await prisma.session.findUnique({ where: { id: roomId }, select: { status: true } });
+    if (dbSession?.status === 'ARCHIVED') {
+      socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "세션이 종료되어 입장할 수 없습니다" });
       return;
     }
 
