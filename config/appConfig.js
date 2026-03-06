@@ -7,6 +7,7 @@ const APP_CONFIG = {
   SESSION_PREFIX: 'session:',
   SESSION_TTL_SECONDS: Number(process.env.SESSION_TTL_SECONDS) || 21600,
   WHITEBOARD_TTL_AFTER_END: Number(process.env.WHITEBOARD_TTL_AFTER_END) || 600,
+  USER_SESSION_CACHE_TTL: Number(process.env.USER_SESSION_CACHE_TTL) || 21600,
 };
 
 module.exports = { APP_CONFIG };

@@ -893,6 +893,28 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       message: "교사가 수업을 종료했습니다",
     });
 
+    // ✅ #41: 세션 참여자 lastSession 캐시 삭제 (현재 sessionId와 일치하는 것만)
+    const sessionUsersKey = `session:${sessionId}:users`;
+    const userIds = await redis.smembers(sessionUsersKey);
+    if (userIds.length > 0) {
+      const getPipeline = redis.pipeline();
+      for (const userId of userIds) getPipeline.get(`user:${userId}:lastSession`);
+      const getResults = await getPipeline.exec();
+
+      const delPipeline = redis.pipeline();
+      for (let i = 0; i < userIds.length; i++) {
+        const raw = getResults[i][1];
+        if (raw) {
+          try {
+            const cached = JSON.parse(raw);
+            if (cached.sessionId === sessionId) delPipeline.del(`user:${userIds[i]}:lastSession`);
+          } catch (_) {}
+        }
+      }
+      delPipeline.del(sessionUsersKey);
+      await delPipeline.exec();
+    }
+
     logger.info("✅ session ended", {
       sessionId,
       classId: session.classId,
@@ -1041,17 +1063,37 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
   }
 
 
-    const session = await sessionStore.get(roomId);
-    if (!session) {
-      socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_NOT_FOUND, message: "Session not found" });
-      return;
+    // ✅ #41: 캐시 우선 조회 (userId → lastSession)
+    const cacheKey = `user:${socket.data.userId}:lastSession`;
+    let session = null;
+    let cacheHit = false;
+
+    const cachedRaw = await redis.get(cacheKey);
+    if (cachedRaw) {
+      try {
+        const cached = JSON.parse(cachedRaw);
+        if (cached.sessionId === roomId) {
+          session = { classId: cached.classId, materialId: cached.materialId ?? null };
+          cacheHit = true;
+        }
+      } catch (_) {}
     }
 
-    // ✅ #39: 종료된 세션 재입장 차단
-    const dbSession = await prisma.session.findUnique({ where: { id: roomId }, select: { status: true } });
-    if (dbSession?.status === 'ARCHIVED') {
-      socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "세션이 종료되어 입장할 수 없습니다" });
-      return;
+    if (!cacheHit) {
+      const fetched = await sessionStore.get(roomId);
+      if (!fetched) {
+        socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_NOT_FOUND, message: "Session not found" });
+        return;
+      }
+
+      // ✅ #39: 종료된 세션 재입장 차단 (캐시 미스 시에만 DB 조회)
+      const dbSession = await prisma.session.findUnique({ where: { id: roomId }, select: { status: true } });
+      if (dbSession?.status === 'ARCHIVED') {
+        socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "세션이 종료되어 입장할 수 없습니다" });
+        return;
+      }
+
+      session = fetched;
     }
 
     // ✅ classId 불일치 차단
@@ -1119,6 +1161,21 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       classId: session.classId,
       user: { userId: socket.data.userId, role: socket.data.role }
     });
+
+    // ✅ #41: 캐시 저장 (캐시 미스였을 때만)
+    if (!cacheHit) {
+      const pipeline = redis.pipeline();
+      pipeline.set(
+        `user:${socket.data.userId}:lastSession`,
+        JSON.stringify({ sessionId: roomId, classId: session.classId, materialId: session.materialId ?? null }),
+        'EX',
+        APP_CONFIG.USER_SESSION_CACHE_TTL,
+      );
+      // 세션에 입장한 전체 userId 추적 (나간 사람 포함, 종료 시 캐시 일괄 삭제용)
+      pipeline.sadd(`session:${roomId}:users`, socket.data.userId);
+      pipeline.expire(`session:${roomId}:users`, APP_CONFIG.USER_SESSION_CACHE_TTL);
+      await pipeline.exec();
+    }
 
     // ✅ #38: presence 입장 처리
     const sessionPresence = getSessionPresence(roomId);
