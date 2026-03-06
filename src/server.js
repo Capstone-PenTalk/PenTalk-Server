@@ -38,6 +38,9 @@ const pendingStrokes = new Map();
 // ✅ #38: presence 자료구조 (sessionId -> Map(userKey -> socketId))
 const presenceBySession = new Map();
 
+// ✅ #42: 종료된 세션 Set (draw 이벤트 차단용)
+const archivedSessions = new Set();
+
 function userKeyOf(socket) {
   return `${socket.data.role}:${socket.data.userId}`;
 }
@@ -885,6 +888,8 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     // 9. Socket session:ended 브로드캐스트
     const studentsRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:students`;
     const teachersRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:teachers`;
+    archivedSessions.add(sessionId);
+
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
       endedAt: closedAt.getTime(),
@@ -940,6 +945,49 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       });
     } catch (_) { /* DB 기록 실패는 무시 */ }
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "SESSION_END_FAILED");
+  }
+});
+
+// ✅ #42: 판서 데이터 조회 API (ARCHIVED → 파일, ACTIVE → Redis)
+app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    // ARCHIVED 여부 DB 확인
+    const dbSession = await prisma.session.findUnique({
+      where: { id: sessionId },
+      select: { status: true, drawingPath: true },
+    });
+
+    if (dbSession?.status === 'ARCHIVED') {
+      if (!dbSession.drawingPath) {
+        return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "DRAWING_NOT_FOUND");
+      }
+      const raw = await fs.promises.readFile(dbSession.drawingPath, 'utf8');
+      const data = JSON.parse(raw);
+      return res.json({ sessionId, readOnly: true, strokes: data.strokes ?? [] });
+    }
+
+    // ACTIVE: Redis에서 조회
+    const session = await sessionStore.get(sessionId);
+    if (!session) {
+      return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "SESSION_NOT_FOUND");
+    }
+
+    const wbKey = `whiteboard:${sessionId}`;
+    const raw = await redis.get(wbKey);
+    let strokes = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+      } catch (_) {}
+    }
+
+    return res.json({ sessionId, readOnly: false, strokes });
+  } catch (err) {
+    logger.error("whiteboard get failed", { sessionId, err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "WHITEBOARD_GET_FAILED");
   }
 });
 
@@ -1381,6 +1429,12 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     });
   }
 
+  // ✅ #42: 종료된 세션 판서 차단
+  if (archivedSessions.has(socket.data.roomId)) {
+    logger.warn("draw:append blocked: session archived", { sessionId: socket.data.roomId, userId: socket.data.userId });
+    return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "종료된 세션에서는 판서가 불가합니다" });
+  }
+
   const roomId = payload.r || socket.data.roomId;
   if (roomId !== socket.data.roomId) {
     return socket.emit(SOCKET_EVENTS.ERROR, {
@@ -1511,6 +1565,12 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DRAW_CLEAR_PAYLOAD",
       });
+    }
+
+    // ✅ #42: 종료된 세션 판서 차단
+    if (archivedSessions.has(socket.data.roomId)) {
+      logger.warn("draw:clear blocked: session archived", { sessionId: socket.data.roomId, userId: socket.data.userId });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "종료된 세션에서는 판서가 불가합니다" });
     }
 
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_CLEAR, {
