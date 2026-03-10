@@ -115,13 +115,40 @@ async function withWhiteboardLock(sessionId, fn) {
   throw new Error(`whiteboard lock timeout sessionId=${sessionId}`);
 }
 
-// room별 draw tick 카운터 (순서 보장용)
+// ✅ #44: room별 draw tick 카운터 (de 이벤트 기준, 재연결 시 Redis meta에서 복원)
 const roomDrawTick = new Map();
+const tickInitPromise = new Map(); // single-flight: 동시 초기화 중복 방지
 
-function getNextTick(roomName) {
-  const t = (roomDrawTick.get(roomName) || 0) + 1;
-  roomDrawTick.set(roomName, t);
-  return t;
+async function getNextTick(roomId) {
+  if (!roomDrawTick.has(roomId)) {
+    // 이미 초기화 중인 Promise가 없을 때만 생성 (single-flight)
+    // has() → set() 사이에 await 없으므로 동시 분기 진입 불가
+    if (!tickInitPromise.has(roomId)) {
+      const p = (async () => {
+        let base = 0;
+        try {
+          const rawMeta = await redis.get(`whiteboardMeta:${roomId}`);
+          if (rawMeta) {
+            const parsed = JSON.parse(rawMeta);
+            base = Number.isInteger(parsed?.serverTick) ? parsed.serverTick : 0;
+          }
+        } catch (err) {
+          logger.error("Failed to restore tick from Redis", { roomId, err: err?.message });
+        }
+        roomDrawTick.set(roomId, base);
+      })().finally(() => {
+        // finally: 성공/실패 모두 정리 (await 뒤 delete보다 안전)
+        tickInitPromise.delete(roomId);
+      });
+      tickInitPromise.set(roomId, p);
+    }
+    await tickInitPromise.get(roomId);
+  }
+
+  // await 없음 → 동기 실행 → 중복 tick 없음
+  const next = (roomDrawTick.get(roomId) ?? 0) + 1;
+  roomDrawTick.set(roomId, next);
+  return next;
 }
 
 // ✅ 가드 헬퍼 함수
@@ -871,7 +898,11 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     await fs.promises.rename(tmpPath, filePath);
 
     // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
-    await redis.expire(wbKey, APP_CONFIG.WHITEBOARD_TTL_AFTER_END);
+    // ✅ #44: whiteboard와 whiteboardMeta 함께 축소 (meta만 남으면 복원 판단 미묘해짐)
+    await Promise.all([
+      redis.expire(wbKey, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
+      redis.expire(`whiteboardMeta:${sessionId}`, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
+    ]);
 
     // 8. DB 상태: CLOSING → ARCHIVED
     const closedAt = new Date();
@@ -889,6 +920,11 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     const studentsRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:students`;
     const teachersRoom = `${APP_CONFIG.SESSION_PREFIX}${sessionId}:teachers`;
     archivedSessions.add(sessionId);
+
+    // ✅ #44: 세션 완전 종료 시 in-memory 정리 (메모리 누수 방지)
+    roomDrawTick.delete(sessionId);
+    tickInitPromise.delete(sessionId);
+    pendingStrokes.delete(sessionId);
 
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
@@ -1210,6 +1246,13 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       user: { userId: socket.data.userId, role: socket.data.role }
     });
 
+    // ✅ #44: 재연결 시 TTL 갱신 (키 없으면 expire는 무시됨 → allSettled)
+    await Promise.allSettled([
+      redis.expire(`session:${roomId}`, APP_CONFIG.SESSION_TTL_SECONDS),
+      redis.expire(`whiteboard:${roomId}`, APP_CONFIG.SESSION_TTL_SECONDS),
+      redis.expire(`whiteboardMeta:${roomId}`, APP_CONFIG.SESSION_TTL_SECONDS),
+    ]);
+
     // ✅ #41: 캐시 저장 (캐시 미스였을 때만)
     if (!cacheHit) {
       const pipeline = redis.pipeline();
@@ -1256,8 +1299,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
   });
 
-  // ✅ sync:request (재접속 시 명시적 판서 상태 요청 → sync:state 응답)
-  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async () => {
+  // ✅ #44: sync:request (재연결 시 lastTick 기반 delta 또는 full sync)
+  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async ({ lastTick } = {}) => {
     if (!requireJoined(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.NOT_JOINED,
@@ -1266,27 +1309,74 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     }
 
     const roomId = socket.data.roomId;
-    logger.info("sync:request received", {
-      socketId: socket.id,
-      userId: socket.data.userId,
-      role: socket.data.role,
-      roomId,
-    });
+    const wbKey = `whiteboard:${roomId}`;
+    const metaKey = `whiteboardMeta:${roomId}`;
+
+    // 정수 + 0 이상만 유효 (NaN, 음수, 소수 제외)
+    const clientLastTick =
+      Number.isInteger(lastTick) && lastTick >= 0 ? lastTick : null;
 
     try {
-      const wbKey = `whiteboard:${roomId}`;
-      const raw = await redis.get(wbKey);
+      const [rawBoard, rawMeta] = await Promise.all([
+        redis.get(wbKey),
+        redis.get(metaKey),
+      ]);
+
       let strokes = [];
-      if (raw) {
+      if (rawBoard) {
         try {
-          const parsed = JSON.parse(raw);
+          const parsed = JSON.parse(rawBoard);
           strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
         } catch (e) {
           logger.warn("invalid whiteboard json on sync", { roomId, err: e?.message });
         }
       }
-      socket.emit(SOCKET_EVENTS.SYNC_STATE, { strokes });
-      logger.info("sync:state sent", { roomId, count: strokes.length });
+
+      // meta 파싱 실패 시 보수적으로 hasDestructiveChange: true
+      let meta = { serverTick: 0, hasDestructiveChange: true };
+      if (rawMeta) {
+        try {
+          const parsed = JSON.parse(rawMeta);
+          meta = {
+            serverTick: Number.isInteger(parsed?.serverTick) ? parsed.serverTick : 0,
+            hasDestructiveChange: parsed?.hasDestructiveChange === true,
+            updatedAt: parsed?.updatedAt ?? 0,
+          };
+        } catch (e) {
+          logger.warn("invalid whiteboard meta json on sync", { roomId, err: e?.message });
+        }
+      }
+
+      // delta 가능 조건:
+      // rawBoard === null → Redis miss (TTL 만료). strokes:[]인 정상 빈 보드와 구분
+      const hasNoTickData = strokes.some((s) => s.t == null);
+      const canDelta =
+        clientLastTick !== null &&
+        rawBoard !== null &&
+        !hasNoTickData &&
+        !meta.hasDestructiveChange;
+
+      const mode = canDelta ? "delta" : "full";
+      const payloadStrokes = canDelta
+        ? strokes.filter((s) => s.t > clientLastTick)
+        : strokes;
+
+      socket.emit(SOCKET_EVENTS.SYNC_STATE, {
+        strokes: payloadStrokes,
+        mode,
+        serverTick: meta.serverTick,
+      });
+
+      logger.info("sync:state sent", {
+        roomId,
+        mode,
+        total: strokes.length,
+        delta: payloadStrokes.length,
+        clientLastTick,
+        serverTick: meta.serverTick,
+        destructive: meta.hasDestructiveChange,
+        redisMiss: rawBoard === null,
+      });
     } catch (err) {
       logger.error("sync:state failed", { err: err?.message });
       socket.emit(SOCKET_EVENTS.ERROR, {
@@ -1488,28 +1578,57 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     }
   }
 
-  socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
-    ...payload,
-    senderUserId: socket.data.userId,
-    senderRole: socket.data.role,
-    t: getNextTick(socket.data.studentsRoom),
-    ts: Date.now(),
-  });
+  // ✅ #44: ds, dm → tick 없이 브로드캐스트 (휘발성, delta sync 대상 아님)
+  if (e === "ds" || e === "dm") {
+    socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
+      ...payload,
+      senderUserId: socket.data.userId,
+      senderRole: socket.data.role,
+      ts: Date.now(),
+    });
+    logger.info("📐draw:append broadcast", {
+      fromUserId: socket.data.userId,
+      roomId: socket.data.roomId,
+      e: payload.e,
+      sId: payload.sId,
+    });
+    return;
+  }
 
-  logger.info("📐draw:append broadcast", {
-    fromUserId: socket.data.userId,
-    roomId: socket.data.roomId,
-    studentsRoom: socket.data.studentsRoom,
-    e: payload.e,
-    sId: payload.sId,
-  });
-
-  // ✅ #74: de 시 whiteboard Redis 저장 (string/JSON: { strokes: [...] })
+  // ✅ #44: de → tick 발급 후 브로드캐스트 + Redis 저장 (tick은 emit/store 동일값)
   if (e === "de") {
     const sessionId = socket.data.roomId;
     const wbKey = `whiteboard:${sessionId}`;
+    const metaKey = `whiteboardMeta:${sessionId}`;
+
+    const tick = await getNextTick(sessionId);
+    const ts = Date.now();
+
+    socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
+      ...payload,
+      senderUserId: socket.data.userId,
+      senderRole: socket.data.role,
+      t: tick,
+      ts,
+    });
+
+    logger.info("📐draw:append broadcast", {
+      fromUserId: socket.data.userId,
+      roomId: sessionId,
+      e: payload.e,
+      sId: payload.sId,
+      t: tick,
+    });
+
     try {
       const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
+      if (!dsData) {
+        logger.warn("draw:append 'de' received without 'ds'", {
+          sessionId,
+          sId: payload.sId,
+          userId: socket.data.userId,
+        });
+      }
       const newStroke = {
         sId: payload.sId,
         x: dsData?.x ?? 0,
@@ -1517,22 +1636,44 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         c: dsData?.c ?? "#000000",
         w: dsData?.w ?? 2,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
+        t: tick,
       };
 
       // 락 획득 후 GET → parse → upsert → SET (원자적 보장)
       await withWhiteboardLock(sessionId, async () => {
-        const raw = await redis.get(wbKey);
+        const [rawBoard, rawMeta] = await Promise.all([
+          redis.get(wbKey),
+          redis.get(metaKey),
+        ]);
+
         let strokes = [];
-        if (raw) {
+        if (rawBoard) {
           try {
-            const parsed = JSON.parse(raw);
+            const parsed = JSON.parse(rawBoard);
             strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
-          } catch (_) { /* 깨진 데이터면 빈 배열로 초기화 */ }
+          } catch (_) {}
         }
+
+        // 기존 destructive flag 유지 — append가 덮어쓰면 안 됨
+        let prevDestructive = false;
+        if (rawMeta) {
+          try {
+            prevDestructive = JSON.parse(rawMeta)?.hasDestructiveChange === true;
+          } catch (_) {}
+        }
+
         const idx = strokes.findIndex((s) => s.sId === payload.sId);
         if (idx >= 0) strokes[idx] = newStroke;
         else strokes.push(newStroke);
-        await redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS);
+
+        await Promise.all([
+          redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
+          redis.set(metaKey, JSON.stringify({
+            serverTick: tick,
+            hasDestructiveChange: prevDestructive,
+            updatedAt: ts,
+          }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
+        ]);
       });
 
       pendingStrokes.get(sessionId)?.delete(payload.sId);
@@ -1543,7 +1684,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
 });
 
 
-  // ✅ draw:clear (un: 실행취소, er: 지우개)
+  // ✅ #44: draw:clear (cl: 전체 지우기, un: 실행취소, er: 지우개)
   socket.on(SOCKET_EVENTS.DRAW_CLEAR, async (payload) => {
     if (!requireTeacher(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
@@ -1559,8 +1700,14 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       });
     }
 
-    if (!payload || typeof payload.sId !== "number" ||
-        (payload.e !== "un" && payload.e !== "er")) {
+    // cl: sId 불필요 / un, er: sId 필수
+    if (!payload || (payload.e !== "cl" && payload.e !== "un" && payload.e !== "er")) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
+    if (payload.e !== "cl" && typeof payload.sId !== "number") {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DRAW_CLEAR_PAYLOAD",
@@ -1573,31 +1720,55 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.SESSION_ENDED, message: "종료된 세션에서는 판서가 불가합니다" });
     }
 
+    const sessionId = socket.data.roomId;
+    const wbKey = `whiteboard:${sessionId}`;
+    const metaKey = `whiteboardMeta:${sessionId}`;
+
+    const tick = await getNextTick(sessionId);
+    const ts = Date.now();
+
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_CLEAR, {
       e: payload.e,
       sId: payload.sId,
       senderUserId: socket.data.userId,
-      t: getNextTick(socket.data.studentsRoom),
-      ts: Date.now(),
+      t: tick,
+      ts,
     });
 
-    const sessionId = socket.data.roomId;
-    const wbKey = `whiteboard:${sessionId}`;
     try {
-      // 락 획득 후 GET → parse → filter → SET (원자적 보장)
+      // 락 획득 후 GET → parse → filter/clear → SET (원자적 보장)
       await withWhiteboardLock(sessionId, async () => {
-        const raw = await redis.get(wbKey);
+        const rawBoard = await redis.get(wbKey);
         let strokes = [];
-        if (raw) {
+        if (rawBoard) {
           try {
-            const parsed = JSON.parse(raw);
+            const parsed = JSON.parse(rawBoard);
             strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
-          } catch (_) { /* 깨진 데이터면 빈 배열 */ }
+          } catch (_) {}
         }
-        strokes = strokes.filter((s) => s.sId !== payload.sId);
-        await redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS);
+
+        if (payload.e === "cl") {
+          strokes = [];
+        } else {
+          strokes = strokes.filter((s) => s.sId !== payload.sId);
+        }
+
+        await Promise.all([
+          redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
+          redis.set(metaKey, JSON.stringify({
+            serverTick: tick,
+            hasDestructiveChange: true,
+            updatedAt: ts,
+          }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
+        ]);
       });
-      pendingStrokes.get(sessionId)?.delete(payload.sId);
+
+      // cl: pending 전체 정리 / un, er: 해당 sId만 정리
+      const p = pendingStrokes.get(sessionId);
+      if (p) {
+        if (payload.e === "cl") p.clear();
+        else p.delete(payload.sId);
+      }
     } catch (err) {
       logger.error("whiteboard clear failed", { err: err?.message });
     }
@@ -1629,16 +1800,24 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     }
   });
 
-  // ✅ disconnect
-  socket.on("disconnect", () => {
-    logger.info("socket disconnected", { socketId: socket.id });
-    // studentsRoom이 비면 tick 카운터 및 pendingStrokes 정리
+  // ✅ #44: disconnect
+  socket.on("disconnect", (reason) => {
+    logger.info("socket disconnected", {
+      socketId: socket.id,
+      userId: socket.data.userId ?? null,
+      role: socket.data.role ?? null,
+      roomId: socket.data.roomId ?? null,
+      reason,
+    });
+
     const studentsRoom = socket.data?.studentsRoom;
     if (studentsRoom) {
       const sRoom = io.sockets.adapter.rooms.get(studentsRoom);
       if (!sRoom || sRoom.size === 0) {
-        roomDrawTick.delete(studentsRoom);
+        // roomDrawTick은 유지 — 재연결 시 tick 연속성 보장
+        // (서버 재시작 시에는 getNextTick이 Redis meta에서 자동 복원)
         pendingStrokes.delete(socket.data.roomId);
+        tickInitPromise.delete(socket.data.roomId); // 혹시 남은 init promise 정리
       }
     }
   });
