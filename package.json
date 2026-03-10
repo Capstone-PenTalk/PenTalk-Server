@@ -5,7 +5,15 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "jest --runInBand --forceExit"
+  },
+  "jest": {
+    "testTimeout": 15000,
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^uuid$": "<rootDir>/tests/__mocks__/uuid.js"
+    }
   },
   "repository": {
     "type": "git",
@@ -30,6 +38,7 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
+    "jest": "^30.3.0",
     "nodemon": "^3.1.11",
     "prisma": "^6.19.2"
   }
