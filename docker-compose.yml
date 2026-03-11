@@ -20,5 +20,23 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  app:
+    build: .
+    container_name: pentalk-app
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    volumes:
+      - whiteboard_data:/app/storage/whiteboards
+    depends_on:
+      - redis
+      - postgres
+
 volumes:
   postgres_data:
+  whiteboard_data:
