@@ -31,6 +31,24 @@ const redis = require("./lib/redis");
 const MAX_MESSAGE_LEN = 300;
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
+// ✅ #45: 펜 스타일 설정 상수
+const PEN_CONFIG = {
+  DEFAULT_COLOR: "#000000",
+  DEFAULT_WIDTH: 2,
+  MAX_WIDTH: 50, // 프론트 UI 펜 굵기 허용 범위 상한 (픽셀 기준)
+  HEX_RE: /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/,
+};
+
+// ✅ #45: 구형 stroke 데이터(c/w 없음) 정규화
+function normalizeStroke(s) {
+  if (!s) return s;
+  return {
+    ...s,
+    c: (typeof s.c === "string" && PEN_CONFIG.HEX_RE.test(s.c)) ? s.c : PEN_CONFIG.DEFAULT_COLOR,
+    w: (typeof s.w === "number" && s.w > 0 && s.w <= PEN_CONFIG.MAX_WIDTH) ? s.w : PEN_CONFIG.DEFAULT_WIDTH,
+  };
+}
+
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
 // Map<sessionId, Map<sId, {sId, x, y, c, w}>>
 const pendingStrokes = new Map();
@@ -1001,7 +1019,7 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       }
       const raw = await fs.promises.readFile(dbSession.drawingPath, 'utf8');
       const data = JSON.parse(raw);
-      return res.json({ sessionId, readOnly: true, strokes: data.strokes ?? [] });
+      return res.json({ sessionId, readOnly: true, strokes: (data.strokes ?? []).map(normalizeStroke) });
     }
 
     // ACTIVE: Redis에서 조회
@@ -1020,7 +1038,7 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       } catch (_) {}
     }
 
-    return res.json({ sessionId, readOnly: false, strokes });
+    return res.json({ sessionId, readOnly: false, strokes: strokes.map(normalizeStroke) });
   } catch (err) {
     logger.error("whiteboard get failed", { sessionId, err: err?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "WHITEBOARD_GET_FAILED");
@@ -1362,7 +1380,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         : strokes;
 
       socket.emit(SOCKET_EVENTS.SYNC_STATE, {
-        strokes: payloadStrokes,
+        strokes: payloadStrokes.map(normalizeStroke),
         mode,
         serverTick: meta.serverTick,
       });
@@ -1539,8 +1557,8 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     if (typeof payload.sId !== "number" ||
         typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
         typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
-        typeof payload.c !== "string" || !payload.c ||
-        typeof payload.w !== "number" || payload.w <= 0) {
+        typeof payload.c !== "string" || !PEN_CONFIG.HEX_RE.test(payload.c) ||
+        typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DS_PAYLOAD",
@@ -1604,8 +1622,14 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
 
+    // ✅ #45: de 브로드캐스트 전에 dsData를 먼저 조회하여 c/w 보완
+    const sessionMap = pendingStrokes.get(sessionId);
+    const dsData = sessionMap?.get(payload.sId);
+
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
       ...payload,
+      c: dsData?.c ?? PEN_CONFIG.DEFAULT_COLOR,
+      w: dsData?.w ?? PEN_CONFIG.DEFAULT_WIDTH,
       senderUserId: socket.data.userId,
       senderRole: socket.data.role,
       t: tick,
@@ -1621,7 +1645,6 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     });
 
     try {
-      const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
       if (!dsData) {
         logger.warn("draw:append 'de' received without 'ds'", {
           sessionId,
@@ -1633,8 +1656,8 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         sId: payload.sId,
         x: dsData?.x ?? 0,
         y: dsData?.y ?? 0,
-        c: dsData?.c ?? "#000000",
-        w: dsData?.w ?? 2,
+        c: dsData?.c ?? PEN_CONFIG.DEFAULT_COLOR,
+        w: dsData?.w ?? PEN_CONFIG.DEFAULT_WIDTH,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
         t: tick,
       };
@@ -1819,6 +1842,12 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         pendingStrokes.delete(socket.data.roomId);
         tickInitPromise.delete(socket.data.roomId); // 혹시 남은 init promise 정리
       }
+    }
+
+    // ✅ #45: 교사 disconnect 시 해당 소켓의 미완성 stroke 정리 (메모리 누수 방지)
+    // ds → de 없이 끊기면 pendingStrokes에 고아 항목이 남을 수 있음
+    if (socket.data.role === "teacher" && socket.data.roomId) {
+      pendingStrokes.delete(socket.data.roomId);
     }
   });
 });
