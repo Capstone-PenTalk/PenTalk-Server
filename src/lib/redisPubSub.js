@@ -1,7 +1,21 @@
 const { logger } = require("../utils/logger");
 const Redis = require("ioredis");
 
-const REDIS_URL = process.env.REDIS_URL;
+// redis url 정규화를 위한 임시 로직, 데모 끝나면 삭제해도 됨
+function normalizeRedisUrl(rawUrl) {
+  const trimmed = (rawUrl || "").trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith("//")) return `redis:${trimmed}`;
+  if (/^[a-z]+:\/\//i.test(trimmed)) return trimmed;
+  return `redis://${trimmed}`;
+}
+
+const REDIS_URL = normalizeRedisUrl(
+  process.env.REDIS_URL ||
+    process.env.REDIS_PRIVATE_URL ||
+    process.env.REDIS_PUBLIC_URL ||
+    `redis://${process.env.REDIS_HOST || "redis"}:${process.env.REDIS_PORT || 6379}`,
+);
 
 // publisher (메시지 발행 전용)
 const pubClient = new Redis(REDIS_URL);
