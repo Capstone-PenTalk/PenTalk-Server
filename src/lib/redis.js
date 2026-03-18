@@ -3,11 +3,15 @@ const Redis = require("ioredis");
 
 // redis url 정규화를 위한 임시 로직, 데모 끝나면 삭제해도 됨
 function normalizeRedisUrl(rawUrl) {
-  const trimmed = (rawUrl || "").trim();
-  if (!trimmed) return trimmed;
-  if (trimmed.startsWith("//")) return `redis:${trimmed}`;
-  if (/^[a-z]+:\/\//i.test(trimmed)) return trimmed;
-  return `redis://${trimmed}`;
+  let normalized = (rawUrl || "").trim();
+  if (!normalized) return normalized;
+  normalized = normalized.replace(/^['"]|['"]$/g, "");
+  normalized = normalized.replace(/\s+/g, "");
+  normalized = normalized.replace(/^redis_url=/i, "");
+  normalized = normalized.replace(/^url=/i, "");
+  if (normalized.startsWith("//")) return `redis:${normalized}`;
+  if (/^[a-z]+:\/\//i.test(normalized)) return normalized;
+  return `redis://${normalized}`;
 }
 
 const redisUrl = normalizeRedisUrl(
