@@ -42,11 +42,15 @@ const PEN_CONFIG = {
 // ✅ #45: 구형 stroke 데이터(c/w 없음) 정규화
 function normalizeStroke(s) {
   if (!s) return s;
-  return {
+  const normalized = {
     ...s,
     c: (typeof s.c === "string" && PEN_CONFIG.HEX_RE.test(s.c)) ? s.c : PEN_CONFIG.DEFAULT_COLOR,
     w: (typeof s.w === "number" && s.w > 0 && s.w <= PEN_CONFIG.MAX_WIDTH) ? s.w : PEN_CONFIG.DEFAULT_WIDTH,
   };
+  if (!(Number.isInteger(s.page) && s.page >= 1)) {
+    delete normalized.page;
+  }
+  return normalized;
 }
 
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
@@ -1558,17 +1562,20 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
         typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
         typeof payload.c !== "string" || !PEN_CONFIG.HEX_RE.test(payload.c) ||
-        typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH) {
+        typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH ||
+      (payload.page !== undefined && (!Number.isInteger(payload.page) || payload.page < 1))) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DS_PAYLOAD",
       });
     }
     // ✅ #74: ds 데이터를 pendingStrokes에 임시 보관 (de 완성 시 Redis 저장에 사용)
+    // ✅ #47: page는 stroke 시작 시점(ds) 기준으로 고정
     const sid = socket.data.roomId;
     if (!pendingStrokes.has(sid)) pendingStrokes.set(sid, new Map());
     pendingStrokes.get(sid).set(payload.sId, {
       sId: payload.sId, x: payload.x, y: payload.y, c: payload.c, w: payload.w,
+      ...(Number.isInteger(payload.page) && payload.page >= 1 && { page: payload.page }),
     });
   }
 
@@ -1660,6 +1667,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         w: dsData?.w ?? PEN_CONFIG.DEFAULT_WIDTH,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
         t: tick,
+        ...(dsData?.page !== undefined && { page: dsData.page }),
       };
 
       // 락 획득 후 GET → parse → upsert → SET (원자적 보장)
