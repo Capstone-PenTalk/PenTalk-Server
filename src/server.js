@@ -8,6 +8,7 @@ const { ERRORS } = require("../config/errors");
 const { sendHttpError } = require("./utils/httpError");
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { PDFDocument, rgb } = require('pdf-lib');
 
 const WHITEBOARD_DIR = path.join(__dirname, '..', 'storage', 'whiteboards');
 
@@ -31,6 +32,15 @@ const redis = require("./lib/redis");
 const MAX_MESSAGE_LEN = 300;
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
+// ✅ #61: export 제한값
+const EXPORT_CONFIG = {
+  MAX_STUDENT_STROKES: 3000,    // 학생 필기 최대 stroke 수
+  MAX_POINTS_PER_STROKE: 1000,  // stroke당 최대 point 수 (렌더링 단계에서 slice)
+  MAX_TOTAL_POINTS: 50_000,     // 전체 point 수 상한 (메모리/CPU 보호)
+  PDF_FETCH_TIMEOUT_MS: 10_000, // 원본 PDF fetch timeout (ms)
+  // 전체 export timeout은 nginx 레벨에서 제어
+};
+
 // ✅ #45: 펜 스타일 설정 상수
 const PEN_CONFIG = {
   DEFAULT_COLOR: "#000000",
@@ -51,6 +61,51 @@ function normalizeStroke(s) {
     delete normalized.page;
   }
   return normalized;
+}
+
+// ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
+function hexToRgbPdf(hex) {
+  let clean = (typeof hex === 'string' ? hex : '#000000').replace('#', '');
+  if (clean.length === 3) {
+    clean = clean[0]+clean[0]+clean[1]+clean[1]+clean[2]+clean[2];
+  }
+  if (clean.length !== 6 || !/^[0-9a-fA-F]{6}$/.test(clean)) return rgb(0, 0, 0);
+  return rgb(
+    parseInt(clean.slice(0, 2), 16) / 255,
+    parseInt(clean.slice(2, 4), 16) / 255,
+    parseInt(clean.slice(4, 6), 16) / 255,
+  );
+}
+
+// ✅ #61: Flutter Color.value (ARGB int) → pdf-lib rgb 변환
+function argbIntToRgbPdf(argb) {
+  const v = argb >>> 0;
+  return rgb(
+    ((v >> 16) & 0xFF) / 255,
+    ((v >> 8)  & 0xFF) / 255,
+    (v         & 0xFF) / 255,
+  );
+}
+
+// ✅ #61: stroke color 필드 정규화 (hex string 또는 Flutter ARGB int 모두 처리)
+function resolveStrokeColor(stroke) {
+  // hex string: c 필드 (서버 저장 형식)
+  if (typeof stroke.c === 'string' && PEN_CONFIG.HEX_RE.test(stroke.c)) {
+    return hexToRgbPdf(stroke.c);
+  }
+  // Flutter Color.value int: color 필드 (클라이언트 미변환 시 방어)
+  if (typeof stroke.color === 'number' && Number.isInteger(stroke.color)) {
+    return argbIntToRgbPdf(stroke.color);
+  }
+  return rgb(0, 0, 0);
+}
+
+// ✅ #61: stroke width 필드 정규화 (w 또는 width 모두 처리)
+function resolveStrokeWidth(stroke) {
+  const w = stroke.w ?? stroke.width;
+  return (typeof w === 'number' && w > 0 && w <= PEN_CONFIG.MAX_WIDTH)
+    ? w
+    : PEN_CONFIG.DEFAULT_WIDTH;
 }
 
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
@@ -285,6 +340,239 @@ io.use((socket, next) => {
 app.use(cors({
   origin: APP_CONFIG.CORS_ORIGIN,
 }));
+
+// ✅ #61: PDF export
+// global body parser(100kb) 적용 전 실행되도록 app.use(express.json()) 앞에 위치
+app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req, res) => {
+  const exportStart = Date.now();
+  try {
+    const { sessionId, strokes: rawStudentStrokes } = req.body;
+
+    // ── 1. 입력 검증 ──────────────────────────────────────────────
+    if (!sessionId || typeof sessionId !== 'string') {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_ID_REQUIRED');
+    }
+    // strokes 없으면 [] 처리 / 있는데 배열 아니면 400
+    if (rawStudentStrokes !== undefined && !Array.isArray(rawStudentStrokes)) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'STROKES_MUST_BE_ARRAY');
+    }
+    const studentStrokes = rawStudentStrokes ?? [];
+    if (studentStrokes.length > EXPORT_CONFIG.MAX_STUDENT_STROKES) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'TOO_MANY_STROKES');
+    }
+    const totalPoints = studentStrokes.reduce((sum, s) => sum + (Array.isArray(s?.points) ? s.points.length : 0), 0);
+    if (totalPoints > EXPORT_CONFIG.MAX_TOTAL_POINTS) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'TOO_MANY_POINTS');
+    }
+
+    // ── 2. 세션 + material 조회 ───────────────────────────────────
+    const session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      include: { material: { select: { url: true } } },
+    });
+    if (!session) {
+      return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+    }
+    if (!session.material?.url) {
+      return sendHttpError(res, 400, ERRORS.MATERIAL_NOT_FOUND, 'MATERIAL_NOT_FOUND');
+    }
+
+    // ── 3. 권한 검증: 세션 소속 클래스 멤버인지 확인 ──────────────
+    // 현재 정책: classMember 확인 (teacher/student 구분 없이 동일 엔드포인트)
+    // session-level 참가 이력 검증은 이번 범위 외
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
+    }
+
+    // ── 4. 교사 판서 읽기 ─────────────────────────────────────────
+    let teacherStrokes = [];
+
+    if (session.status === 'ARCHIVED') {
+      if (session.drawingPath) {
+        // ARCHIVED + drawingPath 있음: 파일이 기준 데이터 → 실패 시 명시적 500
+        try {
+          const raw = await fs.promises.readFile(session.drawingPath, 'utf8');
+          const data = JSON.parse(raw);
+          teacherStrokes = Array.isArray(data?.strokes) ? data.strokes : [];
+        } catch (e) {
+          logger.error('export: archived teacher strokes file read failed', {
+            sessionId,
+            drawingPath: session.drawingPath,
+            err: e?.message,
+          });
+          return sendHttpError(res, 500, ERRORS.PDF_EXPORT_FAILED, 'TEACHER_STROKES_UNAVAILABLE');
+        }
+      }
+      // ARCHIVED + drawingPath null: 판서 없이 저장된 세션 → soft fail, 그대로 진행
+    } else {
+      // ACTIVE / CLOSING: Redis 조회 → miss는 soft fail (TTL 만료 등 가능)
+      try {
+        const raw = await redis.get(`whiteboard:${sessionId}`);
+        if (raw) {
+          try {
+            const data = JSON.parse(raw);
+            teacherStrokes = Array.isArray(data?.strokes) ? data.strokes : [];
+          } catch (e) {
+            // Redis 파싱 실패: soft fail (교사 판서 없이 진행)
+            logger.warn('export: teacher strokes redis parse failed', { sessionId, err: e?.message });
+          }
+        }
+      } catch (e) {
+        // Redis 연결 에러: soft fail (교사 판서 없이 진행)
+        logger.warn('export: redis get failed', { sessionId, err: e?.message });
+      }
+    }
+
+    // 기존 normalizeStroke 규칙 적용 (c/w/page 누락된 legacy 데이터 보정)
+    teacherStrokes = teacherStrokes.map(normalizeStroke);
+
+    // tick 오름차순 정렬 (t 없는 legacy stroke는 0 취급 → 앞쪽 배치)
+    // t가 없는 데이터는 정확한 순서를 알 수 없으므로 유효 tick stroke 앞에 배치
+    teacherStrokes.sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+
+    // ── 5. 원본 PDF fetch (timeout 포함) ──────────────────────────
+    // 현재는 material.url 직접 fetch. 추후 스토리지 서명 URL 유틸로 분리 가능.
+    const fetchController = new AbortController();
+    const fetchTimeout = setTimeout(
+      () => fetchController.abort(),
+      EXPORT_CONFIG.PDF_FETCH_TIMEOUT_MS,
+    );
+    let pdfBuffer;
+    try {
+      const pdfRes = await fetch(session.material.url, { signal: fetchController.signal });
+      if (!pdfRes.ok) {
+        return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_FAILED');
+      }
+      pdfBuffer = Buffer.from(await pdfRes.arrayBuffer());
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        return sendHttpError(res, 504, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_TIMEOUT');
+      }
+      return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_FAILED');
+    } finally {
+      clearTimeout(fetchTimeout);
+    }
+
+    // ── 6. PDF 로드 ───────────────────────────────────────────────
+    let pdfDoc;
+    try {
+      pdfDoc = await PDFDocument.load(pdfBuffer);
+    } catch (e) {
+      logger.warn('export: pdf-lib load failed', { sessionId, err: e?.message });
+      return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_INVALID');
+    }
+    const totalPages = pdfDoc.getPageCount();
+
+    // ── 7. 학생 stroke 1차 필터링 ────────────────────────────────
+    // - points 1개 이하: 선분 불가 → skip
+    // - tool === 'eraser': skip (클라이언트가 이미 제거 후 전송하므로 방어적 처리)
+    // page 범위/좌표 유효성은 렌더링 단계(2차)에서 처리
+    const validStudentStrokes = studentStrokes.filter(s =>
+      s &&
+      Array.isArray(s.points) &&
+      s.points.length > 1 &&
+      s.tool !== 'eraser'
+    );
+
+    // ── 8. 렌더링 순서 결정 및 page별 그룹핑 ─────────────────────
+    // 교사 판서(tick 오름차순) → 학생 필기(body 순서)
+    // 학생 필기가 항상 교사 판서 위에 렌더링됨
+    const allStrokes = [...teacherStrokes, ...validStudentStrokes];
+
+    const strokesByPage = new Map();
+    for (const stroke of allStrokes) {
+      const pageNum = stroke.page;
+      if (!Number.isInteger(pageNum) || pageNum < 1) {
+        logger.warn('export: stroke skipped (invalid page)', { sessionId, page: pageNum });
+        continue;
+      }
+      const pageIdx = pageNum - 1;
+      if (pageIdx >= totalPages) {
+        logger.warn('export: stroke skipped (page out of range)', { sessionId, pageNum, totalPages });
+        continue;
+      }
+      if (!strokesByPage.has(pageIdx)) strokesByPage.set(pageIdx, []);
+      strokesByPage.get(pageIdx).push(stroke);
+    }
+
+    // ── 9. 판서 합성 ──────────────────────────────────────────────
+    for (const [pageIdx, strokes] of strokesByPage) {
+      const page = pdfDoc.getPage(pageIdx);
+      const { width: pageW, height: pageH } = page.getSize();
+
+      for (const stroke of strokes) {
+        const color = resolveStrokeColor(stroke);
+        const baseWidth = resolveStrokeWidth(stroke);
+        const pts = stroke.points.slice(0, EXPORT_CONFIG.MAX_POINTS_PER_STROKE);
+
+        for (let i = 0; i < pts.length - 1; i++) {
+          const p1 = pts[i];
+          const p2 = pts[i + 1];
+
+          // NaN / Infinity / 비숫자 좌표: 해당 선분만 skip
+          if (
+            typeof p1.x !== 'number' || !isFinite(p1.x) ||
+            typeof p1.y !== 'number' || !isFinite(p1.y) ||
+            typeof p2.x !== 'number' || !isFinite(p2.x) ||
+            typeof p2.y !== 'number' || !isFinite(p2.y)
+          ) continue;
+
+          // 0~1 범위 벗어난 좌표: skip 대신 clamp
+          const x1 = Math.min(1, Math.max(0, p1.x));
+          const y1 = Math.min(1, Math.max(0, p1.y));
+          const x2 = Math.min(1, Math.max(0, p2.x));
+          const y2 = Math.min(1, Math.max(0, p2.y));
+
+          // 필압 적용: p=0 → 0.5배, p=1 → 1.0배
+          const pressure = typeof p1.p === 'number' && isFinite(p1.p)
+            ? Math.min(1, Math.max(0, p1.p))
+            : 0.5;
+          const thickness = baseWidth * (0.5 + pressure * 0.5);
+
+          // 좌표 변환: 정규화(0~1) → PDF pt
+          // y축 반전: Flutter 좌상단 원점(y↓) → PDF 좌하단 원점(y↑)
+          page.drawLine({
+            start: { x: x1 * pageW, y: (1 - y1) * pageH },
+            end:   { x: x2 * pageW, y: (1 - y2) * pageH },
+            thickness,
+            color,
+            opacity: 1,
+          });
+        }
+      }
+    }
+
+    // ── 10. PDF 반환 ──────────────────────────────────────────────
+    const pdfBytes = await pdfDoc.save();
+    const buf = Buffer.from(pdfBytes);
+
+    // 파일명은 sessionId 기반 (한글 파일명 인코딩 문제 방지)
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="export_${sessionId}.pdf"`);
+    res.setHeader('Content-Length', buf.length);
+    res.send(buf);
+
+    logger.info('pdf export success', {
+      sessionId,
+      userId: req.userId,
+      teacherStrokeCount: teacherStrokes.length,
+      studentStrokeCount: validStudentStrokes.length,
+      totalPages,
+      durationMs: Date.now() - exportStart,
+    });
+
+  } catch (err) {
+    const sid = req?.body?.sessionId ?? null;
+    logger.error('pdf export failed', { sessionId: sid, err: err?.message });
+    if (!res.headersSent) {
+      return sendHttpError(res, 500, ERRORS.PDF_EXPORT_FAILED, 'PDF_EXPORT_FAILED');
+    }
+  }
+});
 
 app.use(express.json());
 app.use(express.static(APP_CONFIG.STATIC_DIR));
