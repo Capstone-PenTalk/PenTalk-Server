@@ -11,6 +11,7 @@ const prisma = new PrismaClient();
 const { PDFDocument, rgb } = require('pdf-lib');
 
 const WHITEBOARD_DIR = path.join(__dirname, '..', 'storage', 'whiteboards');
+const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -340,6 +341,10 @@ io.use((socket, next) => {
 app.use(cors({
   origin: APP_CONFIG.CORS_ORIGIN,
 }));
+
+// ✅ #93: 업로드된 PDF 정적 파일 서빙
+// ⚠️ 현재 인증 없이 URL만 알면 누구나 접근 가능. 향후 S3 전환 시 signed URL로 대체 예정.
+app.use('/pdfs', express.static(path.join(__dirname, '..', 'storage', 'pdfs')));
 
 // ✅ #61: PDF export
 // global body parser(100kb) 적용 전 실행되도록 app.use(express.json()) 앞에 위치
@@ -835,6 +840,81 @@ app.delete("/tags/:tagId", requireAuth, requireTeacherRole, async (req, res) => 
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
   }
 });
+
+// ✅ #93: orphan 파일 cleanup helper
+// multer가 디스크에 먼저 저장하므로, 이후 검증/DB 저장 실패 시 반드시 파일을 삭제해야 함.
+// 삭제 실패도 로그로 관측.
+function safeUnlink(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, (err) => {
+    if (err) logger.warn('uploaded file cleanup failed', { filePath, err: err.message });
+  });
+}
+
+// ✅ #93: PDF 수업자료 업로드
+// POST /materials/pdf
+// multipart/form-data: file(pdf 파일), classId(string)
+app.post(
+  ROUTES.MATERIAL_UPLOAD,
+  requireAuth,
+  requireTeacherRole,
+  // multer 에러(FILE_TYPE_INVALID, LIMIT_FILE_SIZE)를 next(err)로 전달하기 위해 콜백 패턴 사용
+  (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+      if (err) return next(err);
+      next();
+    });
+  },
+  async (req, res) => {
+    if (!req.file) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'FILE_REQUIRED');
+    }
+
+    const filePath = req.file.path;
+
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      safeUnlink(filePath);
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'CLASS_ID_REQUIRED');
+    }
+
+    // classId 검증부터 prisma.create까지 하나의 try로 묶음.
+    // findUnique 포함 DB 접근에서 예외가 나도 cleanup이 보장됨.
+    try {
+      const foundClass = await prisma.class.findUnique({
+        where: { id: classId },
+        select: { id: true, teacherId: true },
+      });
+      if (!foundClass) {
+        safeUnlink(filePath);
+        return sendHttpError(res, 404, ERRORS.CLASS_NOT_FOUND, 'CLASS_NOT_FOUND');
+      }
+      if (foundClass.teacherId !== req.userId) {
+        safeUnlink(filePath);
+        return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_TEACHER');
+      }
+
+      const { url } = await saveFile(req, req.file);
+
+      const material = await prisma.material.create({
+        data: {
+          type: 'pdf',
+          url,
+          name: req.file.originalname,
+          classId,
+        },
+        select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
+      });
+
+      logger.info('material uploaded', { materialId: material.id, classId });
+      return res.status(201).json(material);
+    } catch (err) {
+      safeUnlink(filePath);
+      logger.error('material upload failed', { err });
+      return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
+    }
+  }
+);
 
 /**
  * GET /materials?classId=&subjectId=&tagId=&keyword=
@@ -1426,6 +1506,18 @@ res.json({
 });
 });
 
+
+// ✅ #93: multer 에러 핸들러
+// Express 에러 핸들러는 라우트들 뒤, io.on('connection') 앞에 위치해야 함.
+app.use((err, req, res, next) => {
+  if (err.code === 'FILE_TYPE_INVALID') {
+    return sendHttpError(res, 400, ERRORS.FILE_TYPE_INVALID, 'PDF_ONLY');
+  }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return sendHttpError(res, 400, ERRORS.FILE_TOO_LARGE, 'MAX_50MB');
+  }
+  next(err);
+});
 
 /**
  * ✅ Socket.IO 연결
