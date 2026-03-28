@@ -38,6 +38,7 @@ model Material {
   id              String            @id @default(cuid())
   type            String
   url             String
+  name            String?           // ✅ #93: 원본 파일명. nullable인 이유: 기존 데이터(외부 URL 등록분)와의 호환. 신규 업로드분은 항상 채워짐.
   createdAt       DateTime          @default(now())
   classId         String
   class           Class             @relation(fields: [classId], references: [id], onDelete: Cascade)
