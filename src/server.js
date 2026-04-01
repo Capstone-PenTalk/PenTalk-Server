@@ -1648,6 +1648,42 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       user: { userId: socket.data.userId, role: socket.data.role }
     });
 
+    // ✅ #50: join 시 현재 판서 상태 full sync
+    try {
+      const [rawBoard, rawMeta] = await Promise.all([
+        redis.get(`whiteboard:${roomId}`),
+        redis.get(`whiteboardMeta:${roomId}`),
+      ]);
+
+      let strokes = [];
+      let serverTick = 0;
+
+      if (rawBoard) {
+        try {
+          const board = JSON.parse(rawBoard);
+          strokes = Array.isArray(board?.strokes) ? board.strokes : [];
+        } catch (_) {}
+      }
+
+      if (rawMeta) {
+        try {
+          const meta = JSON.parse(rawMeta);
+          serverTick = Number.isInteger(meta?.serverTick) ? meta.serverTick : 0;
+        } catch (_) {}
+      }
+
+      socket.emit(SOCKET_EVENTS.SYNC_STATE, {
+        mode: 'full',
+        strokes: strokes.map(normalizeStroke),
+        serverTick,
+      });
+    } catch (err) {
+      logger.warn('join: initial sync failed', {
+        roomId,
+        err: err?.message,
+      });
+    }
+
     // ✅ #44: 재연결 시 TTL 갱신 (키 없으면 expire는 무시됨 → allSettled)
     await Promise.allSettled([
       redis.expire(`session:${roomId}`, APP_CONFIG.SESSION_TTL_SECONDS),
