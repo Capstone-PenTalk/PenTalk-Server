@@ -30,7 +30,9 @@ const sessionStore = require('./store/sessionStore');
 const { signToken, verifyToken } = require('./utils/jwt');
 const { pubClient, subClient } = require("./lib/redisPubSub");
 const redis = require("./lib/redis");
+const { randomUUID } = require("crypto");
 const MAX_MESSAGE_LEN = 300;
+const MAX_POLL_DURATION = 300; // ✅ #51: 투표 최대 지속 시간 (초)
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #61: export 제한값
@@ -118,6 +120,18 @@ const presenceBySession = new Map();
 
 // ✅ #42: 종료된 세션 Set (draw 이벤트 차단용)
 const archivedSessions = new Set();
+
+// ✅ #51: 세션별 진행 중인 투표 상태
+// sessionId → {
+//   pollId, question, options, duration,
+//   startedAt, startedBy,
+//   answers: Map(userId → optionId),
+//   counts: { [optionId]: number },
+//   timer: TimeoutId | null
+// }
+// ※ studentsRoom / teachersRoom은 저장하지 않음.
+//   endPoll은 setTimeout에서 호출될 수 있으므로 getRoleRooms(sessionId)로 직접 계산.
+const activePolls = new Map();
 
 function userKeyOf(socket) {
   return `${socket.data.role}:${socket.data.userId}`;
@@ -234,8 +248,51 @@ function requireTeacher(socket) {
   return socket.data.role === "teacher";
 }
 
+// ✅ #51
+function requireStudent(socket) {
+  return socket.data.role === "student";
+}
+
 function requireJoined(socket) {
   return !!socket.currentRoom && !!socket.data.roomId && !!socket.data.classId;
+}
+
+// ✅ #51: option 배열 유효성 검사
+// - 2~4개, id는 string|number, text는 비어있지 않은 문자열, id 중복 없음
+function isValidPollOptions(options) {
+  if (!Array.isArray(options) || options.length < 2 || options.length > 4) return false;
+  const seenIds = new Set();
+  for (const o of options) {
+    if (typeof o.id !== "string" && typeof o.id !== "number") return false;
+    if (typeof o.text !== "string" || !o.text.trim()) return false;
+    if (seenIds.has(o.id)) return false;
+    seenIds.add(o.id);
+  }
+  return true;
+}
+
+// ✅ #51: 투표 종료 공통 처리 (타이머 만료 / 교사 조기 종료 / 세션 종료 모두 이 경로)
+function endPoll(io, sessionId) {
+  const poll = activePolls.get(sessionId);
+  if (!poll) return;
+
+  // 중복 종료 방지를 위해 상태 삭제를 브로드캐스트보다 먼저 수행
+  if (poll.timer) clearTimeout(poll.timer);
+  activePolls.delete(sessionId);
+
+  const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+
+  io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.POLL_END, {
+    pollId: poll.pollId,
+    counts: { ...poll.counts },
+    total: poll.answers.size,
+  });
+
+  logger.info("📊 poll ended", {
+    sessionId,
+    pollId: poll.pollId,
+    total: poll.answers.size,
+  });
 }
 
 const app = express();
@@ -1315,6 +1372,8 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     roomDrawTick.delete(sessionId);
     tickInitPromise.delete(sessionId);
     pendingStrokes.delete(sessionId);
+    // ✅ #51: 진행 중 투표가 있으면 타이머 취소 + 최종 결과 브로드캐스트 후 정리
+    if (activePolls.has(sessionId)) endPoll(io, sessionId);
 
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
@@ -1852,6 +1911,131 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
   logger.error("❌dm publish failed", { err: err?.message });
   socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.DM_PUBLISH_FAILED, message: "DM publish failed" });
 }
+  });
+
+  // ✅ #51: 교사 → 학생 전체 투표 시작
+  socket.on(SOCKET_EVENTS.POLL_START, ({ question, options, duration } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teacher role required" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+
+    if (activePolls.has(sessionId)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_ALREADY_ACTIVE, message: "이미 진행 중인 투표가 있습니다" });
+    }
+
+    if (typeof question !== "string" || !question.trim() || !isValidPollOptions(options)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "INVALID_POLL_PAYLOAD" });
+    }
+
+    // duration 미제공(undefined) → null (타이머 없음)
+    // 제공됐으나 범위 벗어남 → PAYLOAD_INVALID
+    let validDuration = null;
+    if (duration !== undefined) {
+      if (typeof duration !== "number" || duration <= 0 || duration > MAX_POLL_DURATION) {
+        return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "INVALID_POLL_DURATION" });
+      }
+      validDuration = duration;
+    }
+
+    const pollId = randomUUID();
+    const normalizedQuestion = question.trim();
+    const counts = {};
+    options.forEach(o => { counts[o.id] = 0; });
+
+    activePolls.set(sessionId, {
+      pollId,
+      question: normalizedQuestion,
+      options,
+      duration: validDuration,
+      startedAt: Date.now(),
+      startedBy: socket.data.userId,
+      answers: new Map(),
+      counts,
+      timer: validDuration
+        ? setTimeout(() => endPoll(io, sessionId), validDuration * 1000)
+        : null,
+    });
+
+    const { studentsRoom } = getRoleRooms(sessionId);
+    io.to(studentsRoom).emit(SOCKET_EVENTS.POLL_START, {
+      pollId,
+      question: normalizedQuestion,
+      options,
+      duration: validDuration,
+    });
+
+    logger.info("📊 poll started", {
+      sessionId,
+      pollId,
+      teacherUserId: socket.data.userId,
+      duration: validDuration,
+    });
+  });
+
+  // ✅ #51: 학생 응답 수신 → 교사에게 실시간 집계 전송
+  socket.on(SOCKET_EVENTS.POLL_ANSWER, ({ pollId, optionId } = {}) => {
+    if (!requireStudent(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Students only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+    const poll = activePolls.get(sessionId);
+
+    if (!poll || poll.pollId !== pollId) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_NOT_FOUND, message: "활성 투표가 없습니다" });
+    }
+    if (poll.answers.has(socket.data.userId)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_ALREADY_ANSWERED, message: "이미 응답한 투표입니다" });
+    }
+    if (!(optionId in poll.counts)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_INVALID_OPTION, message: "유효하지 않은 선택지입니다" });
+    }
+
+    // 현재 단일 프로세스/단일 인스턴스 기준으로 동시성 문제 가능성 낮음.
+    // 수평 확장(멀티 서버) 시 Redis atomic 연산으로 교체 필요.
+    poll.answers.set(socket.data.userId, optionId);
+    poll.counts[optionId] += 1;
+
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.POLL_RESULT, {
+      pollId,
+      counts: { ...poll.counts },
+      total: poll.answers.size,
+    });
+
+    logger.info("📊 poll answer received", {
+      sessionId,
+      pollId,
+      userId: socket.data.userId,
+      optionId,
+    });
+  });
+
+  // ✅ #51: 교사 조기 종료
+  socket.on(SOCKET_EVENTS.POLL_END, ({ pollId } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teacher role required" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+    const poll = activePolls.get(sessionId);
+
+    if (!poll || poll.pollId !== pollId) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_NOT_FOUND, message: "활성 투표가 없습니다" });
+    }
+
+    endPoll(io, sessionId);
   });
 
   // ✅ chat (보낸 사람 제외)
