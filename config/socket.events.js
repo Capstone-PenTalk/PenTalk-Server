@@ -14,6 +14,12 @@ const SOCKET_EVENTS = {
   PRESENCE_JOIN: 'presence:join',
   PRESENCE_LEAVE: 'presence:leave',
   PRESENCE_STATE: 'presence:state',
+
+  // ✅ #51
+  POLL_START:   'poll:start',
+  POLL_END:     'poll:end',
+  POLL_ANSWER:  'poll:answer',
+  POLL_RESULT:  'poll:result',
 };
 
 module.exports = { SOCKET_EVENTS };
