@@ -272,6 +272,14 @@ function isValidPollOptions(options) {
   return true;
 }
 
+/// ✅ #55: 익명 여부에 따라 askedBy 구성
+// userId: null → 익명 사용자 (프론트에서 "익명" 등으로 표시). 문구/아이콘 결정은 클라이언트 담당
+function resolveAskedBy(userId, isAnonymous) {
+  return isAnonymous
+    ? { userId: null, isAnonymous: true }
+    : { userId, isAnonymous: false };
+}
+
 // ✅ #51: 투표 종료 공통 처리 (타이머 만료 / 교사 조기 종료 / 세션 종료 모두 이 경로)
 function endPoll(io, sessionId) {
   const poll = activePolls.get(sessionId);
@@ -2039,8 +2047,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     endPoll(io, sessionId);
   });
 
-  // ✅ #54: 학생 질문 수신 → DB 저장 → 교사에게 전달
-  socket.on(SOCKET_EVENTS.QUESTION_ASK, async ({ content } = {}) => {
+  // ✅ #54 + #55: 학생 질문 수신 → DB 저장 → 교사에게 전달
+  socket.on(SOCKET_EVENTS.QUESTION_ASK, async ({ content, isAnonymous = false } = {}) => {
     if (!requireStudent(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Students only" });
     }
@@ -2052,7 +2060,9 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
     }
 
-    const trimmed = content.trim();
+    const trimmed  = content.trim();
+    // boolean이 아닌 값(예: 문자열 "true")은 false로 간주
+    const anonymous = isAnonymous === true;
 
     if (!trimmed) {
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
@@ -2069,7 +2079,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         question = await prisma.question.create({
-          data: { sessionId, userId, content: trimmed },
+          data: { sessionId, userId, content: trimmed, isAnonymous: anonymous },
         });
         break;
       } catch (err) {
@@ -2080,24 +2090,26 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       }
     }
 
+    // ACK: 본인에게만 반환. 마스킹 없이 isAnonymous를 최상위에 포함
     socket.emit(SOCKET_EVENTS.QUESTION_ACK, {
-      questionId: question.id,
-      content:    question.content,
-      status:     question.status,
-      askedAt:    question.createdAt.getTime(),
+      questionId:  question.id,
+      content:     question.content,
+      status:      question.status,
+      isAnonymous: question.isAnonymous,
+      askedAt:     question.createdAt.getTime(),
     });
 
-    // 익명 질문 정책: teacher 룸 전용 broadcast
+    // QUESTION_NEW: 교사에게 broadcast. askedBy 내부에 isAnonymous 포함
     const { teachersRoom } = getRoleRooms(sessionId);
     io.to(teachersRoom).emit(SOCKET_EVENTS.QUESTION_NEW, {
       questionId: question.id,
       content:    question.content,
-      askedBy:    { userId },
+      askedBy:    resolveAskedBy(userId, anonymous),
       status:     question.status,
       askedAt:    question.createdAt.getTime(),
     });
 
-    logger.info("❓ question received", { sessionId, userId, questionId: question.id });
+    logger.info("❓ question received", { sessionId, userId, questionId: question.id, isAnonymous: anonymous });
   });
 
   // ✅ #54: 교사 질문 목록 조회 (재접속 sync 용)
@@ -2116,7 +2128,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       questions = await prisma.question.findMany({
         where:   { sessionId },
         orderBy: { createdAt: "asc" },
-        select:  { id: true, userId: true, content: true, status: true, createdAt: true },
+        select:  { id: true, userId: true, content: true, status: true, isAnonymous: true, createdAt: true },
       });
     } catch (err) {
       logger.error("question list failed", { sessionId, err });
@@ -2127,7 +2139,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       questions: questions.map(q => ({
         questionId: q.id,
         content:    q.content,
-        askedBy:    { userId: q.userId },
+        askedBy:    resolveAskedBy(q.userId, q.isAnonymous),
         status:     q.status,
         askedAt:    q.createdAt.getTime(),
       })),
