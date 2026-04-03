@@ -12,10 +12,5 @@ CREATE TABLE "Question" (
     CONSTRAINT "Question_pkey" PRIMARY KEY ("id")
 );
 
--- AddForeignKey
-ALTER TABLE "Question"
-    ADD CONSTRAINT "Question_sessionId_fkey"
-    FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
 -- CreateIndex
 CREATE INDEX "Question_sessionId_createdAt_idx" ON "Question"("sessionId", "createdAt");

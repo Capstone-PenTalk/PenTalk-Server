@@ -116,8 +116,6 @@ model Session {
   endAttempts Int           @default(0)
   endError    String?
   createdAt   DateTime      @default(now())
-  questions   Question[]
-
   @@index([classId, createdAt])
   @@index([status])
 }
@@ -125,7 +123,6 @@ model Session {
 model Question {
   id        String         @id @default(cuid())
   sessionId String
-  session   Session        @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   userId    String
   content   String
   status    QuestionStatus @default(PENDING)
