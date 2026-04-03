@@ -32,7 +32,8 @@ const { pubClient, subClient } = require("./lib/redisPubSub");
 const redis = require("./lib/redis");
 const { randomUUID } = require("crypto");
 const MAX_MESSAGE_LEN = 300;
-const MAX_POLL_DURATION = 300; // ✅ #51: 투표 최대 지속 시간 (초)
+const MAX_POLL_DURATION = 300;     // ✅ #51: 투표 최대 지속 시간 (초)
+const MAX_QUESTION_LENGTH = 500;   // ✅ #54: 질문 최대 길이 (자)
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #61: export 제한값
@@ -2036,6 +2037,101 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     }
 
     endPoll(io, sessionId);
+  });
+
+  // ✅ #54: 학생 질문 수신 → DB 저장 → 교사에게 전달
+  socket.on(SOCKET_EVENTS.QUESTION_ASK, async ({ content } = {}) => {
+    if (!requireStudent(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Students only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    if (typeof content !== "string") {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
+    }
+
+    const trimmed = content.trim();
+
+    if (!trimmed) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
+    }
+    if (trimmed.length > MAX_QUESTION_LENGTH) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_TOO_LONG, message: `최대 ${MAX_QUESTION_LENGTH}자` });
+    }
+
+    const sessionId = socket.data.roomId;
+    const userId    = socket.data.userId;
+
+    // retry 1회 — 일시적 커넥션 실패 완화 목적. FK 제약 위반 등 영구 오류는 해결하지 않음
+    let question;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        question = await prisma.question.create({
+          data: { sessionId, userId, content: trimmed },
+        });
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          logger.error("question save failed", { sessionId, userId, err });
+          return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_SAVE_FAILED, message: "저장 실패" });
+        }
+      }
+    }
+
+    socket.emit(SOCKET_EVENTS.QUESTION_ACK, {
+      questionId: question.id,
+      content:    question.content,
+      status:     question.status,
+      askedAt:    question.createdAt.getTime(),
+    });
+
+    // 익명 질문 정책: teacher 룸 전용 broadcast
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.QUESTION_NEW, {
+      questionId: question.id,
+      content:    question.content,
+      askedBy:    { userId },
+      status:     question.status,
+      askedAt:    question.createdAt.getTime(),
+    });
+
+    logger.info("❓ question received", { sessionId, userId, questionId: question.id });
+  });
+
+  // ✅ #54: 교사 질문 목록 조회 (재접속 sync 용)
+  socket.on(SOCKET_EVENTS.QUESTION_LIST, async () => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teachers only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    const sessionId = socket.data.roomId;
+
+    let questions;
+    try {
+      questions = await prisma.question.findMany({
+        where:   { sessionId },
+        orderBy: { createdAt: "asc" },
+        select:  { id: true, userId: true, content: true, status: true, createdAt: true },
+      });
+    } catch (err) {
+      logger.error("question list failed", { sessionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_LIST_FAILED, message: "목록 조회 실패" });
+    }
+
+    socket.emit(SOCKET_EVENTS.QUESTION_LIST_RESULT, {
+      questions: questions.map(q => ({
+        questionId: q.id,
+        content:    q.content,
+        askedBy:    { userId: q.userId },
+        status:     q.status,
+        askedAt:    q.createdAt.getTime(),
+      })),
+    });
   });
 
   // ✅ chat (보낸 사람 제외)
