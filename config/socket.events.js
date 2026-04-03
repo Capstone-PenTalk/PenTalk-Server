@@ -20,6 +20,13 @@ const SOCKET_EVENTS = {
   POLL_END:     'poll:end',
   POLL_ANSWER:  'poll:answer',
   POLL_RESULT:  'poll:result',
+
+  // ✅ #54
+  QUESTION_ASK:         'question:ask',
+  QUESTION_ACK:         'question:ack',
+  QUESTION_NEW:         'question:new',
+  QUESTION_LIST:        'question:list',
+  QUESTION_LIST_RESULT: 'question:list:result',
 };
 
 module.exports = { SOCKET_EVENTS };
