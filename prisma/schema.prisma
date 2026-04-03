@@ -121,12 +121,13 @@ model Session {
 }
 
 model Question {
-  id        String         @id @default(cuid())
-  sessionId String
-  userId    String
-  content   String
-  status    QuestionStatus @default(PENDING)
-  createdAt DateTime       @default(now())
+  id          String         @id @default(cuid())
+  sessionId   String
+  userId      String
+  content     String
+  status      QuestionStatus @default(PENDING)
+  isAnonymous Boolean        @default(false)
+  createdAt   DateTime       @default(now())
 
   @@index([sessionId, createdAt])
 }
