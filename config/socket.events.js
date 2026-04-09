@@ -27,6 +27,10 @@ const SOCKET_EVENTS = {
   QUESTION_NEW:         'question:new',
   QUESTION_LIST:        'question:list',
   QUESTION_LIST_RESULT: 'question:list:result',
+
+  // ✅ #56
+  QUESTION_ANSWER:   'question:answer',    // 교사 → 서버 (요청)
+  QUESTION_ANSWERED: 'question:answered',  // 서버 → 클라이언트 (통지)
 };
 
 module.exports = { SOCKET_EVENTS };
