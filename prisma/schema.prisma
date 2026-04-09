@@ -127,6 +127,8 @@ model Question {
   content     String
   status      QuestionStatus @default(PENDING)
   isAnonymous Boolean        @default(false)
+  answer      String?
+  answeredAt  DateTime?
   createdAt   DateTime       @default(now())
 
   @@index([sessionId, createdAt])

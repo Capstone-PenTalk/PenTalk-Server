@@ -34,6 +34,7 @@ const { randomUUID } = require("crypto");
 const MAX_MESSAGE_LEN = 300;
 const MAX_POLL_DURATION = 300;     // ✅ #51: 투표 최대 지속 시간 (초)
 const MAX_QUESTION_LENGTH = 500;   // ✅ #54: 질문 최대 길이 (자)
+const MAX_ANSWER_LENGTH   = 1000;  // ✅ #56: 답변 최대 길이 (자)
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #61: export 제한값
@@ -2112,23 +2113,30 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     logger.info("❓ question received", { sessionId, userId, questionId: question.id, isAnonymous: anonymous });
   });
 
-  // ✅ #54: 교사 질문 목록 조회 (재접속 sync 용)
+  // ✅ #54 + #56: 질문 목록 조회. 교사=전체, 학생=본인 것만
+  // requireTeacher / requireStudent는 순수 boolean 반환 함수 — emit 없음
   socket.on(SOCKET_EVENTS.QUESTION_LIST, async () => {
-    if (!requireTeacher(socket)) {
-      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teachers only" });
+    const isTeacher = requireTeacher(socket);
+    const isStudent = requireStudent(socket);
+
+    if (!isTeacher && !isStudent) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "권한 없음" });
     }
     if (!requireJoined(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
     }
 
     const sessionId = socket.data.roomId;
+    const userId    = socket.data.userId;
+    const where     = isTeacher ? { sessionId } : { sessionId, userId };
 
     let questions;
     try {
       questions = await prisma.question.findMany({
-        where:   { sessionId },
+        where,
         orderBy: { createdAt: "asc" },
-        select:  { id: true, userId: true, content: true, status: true, isAnonymous: true, createdAt: true },
+        select:  { id: true, userId: true, content: true, status: true,
+                   isAnonymous: true, answer: true, answeredAt: true, createdAt: true },
       });
     } catch (err) {
       logger.error("question list failed", { sessionId, err });
@@ -2137,12 +2145,108 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
     socket.emit(SOCKET_EVENTS.QUESTION_LIST_RESULT, {
       questions: questions.map(q => ({
-        questionId: q.id,
-        content:    q.content,
-        askedBy:    resolveAskedBy(q.userId, q.isAnonymous),
-        status:     q.status,
-        askedAt:    q.createdAt.getTime(),
+        questionId:  q.id,
+        content:     q.content,
+        // resolveAskedBy shape: { userId: string|null, isAnonymous: boolean }
+        // 교사: 실제 값 / 학생: null (프론트 팀 확인: nullable 처리됨)
+        askedBy:     isTeacher ? resolveAskedBy(q.userId, q.isAnonymous) : null,
+        status:      q.status,
+        answer:      q.answer ?? null,
+        answeredAt:  q.answeredAt ? q.answeredAt.getTime() : null,
+        askedAt:     q.createdAt.getTime(),
       })),
+    });
+  });
+
+  // ✅ #56: 교사 답변 등록 → 해당 학생 + 교사 룸에 통지
+  socket.on(SOCKET_EVENTS.QUESTION_ANSWER, async ({ questionId, answer } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teachers only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    if (typeof questionId !== "string" || !questionId.trim()) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "questionId 누락" });
+    }
+    if (typeof answer !== "string" || !answer.trim()) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "answer 누락" });
+    }
+
+    const trimmedAnswer     = answer.trim();
+    const trimmedQuestionId = questionId.trim();
+
+    if (trimmedAnswer.length > MAX_ANSWER_LENGTH) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: `답변은 최대 ${MAX_ANSWER_LENGTH}자` });
+    }
+
+    const sessionId = socket.data.roomId;
+
+    // 1) findFirst: userId 확보 + 존재/세션 검증 + 상태 사전 확인
+    //    에러 의미를 NOT_FOUND / ALREADY_ANSWERED로 분리하기 위해 먼저 조회
+    let question;
+    try {
+      question = await prisma.question.findFirst({
+        where:  { id: trimmedQuestionId, sessionId },
+        select: { id: true, userId: true, status: true },
+      });
+    } catch (err) {
+      logger.error("question answer fetch failed", { sessionId, questionId: trimmedQuestionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ANSWER_FAILED, message: "답변 처리 실패" });
+    }
+
+    if (!question) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_NOT_FOUND, message: "질문을 찾을 수 없습니다" });
+    }
+    if (question.status === "ANSWERED") {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ALREADY_ANSWERED, message: "이미 답변된 질문입니다" });
+    }
+
+    // 2) updateMany with status: "PENDING" 조건 — 동시성 방어
+    //    findFirst와 updateMany 사이에 다른 요청이 먼저 처리하여
+    //    상태가 PENDING이 아닌 경우 count === 0으로 감지
+    const now = new Date();
+    let updated;
+    try {
+      updated = await prisma.question.updateMany({
+        where: { id: trimmedQuestionId, sessionId, status: "PENDING" },
+        data:  { answer: trimmedAnswer, status: "ANSWERED", answeredAt: now },
+      });
+    } catch (err) {
+      logger.error("question answer update failed", { sessionId, questionId: trimmedQuestionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ANSWER_FAILED, message: "답변 저장 실패" });
+    }
+
+    if (updated.count === 0) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ALREADY_ANSWERED, message: "이미 답변된 질문입니다" });
+    }
+
+    // 3) 통지 payload — 이번 범위 최소 구성 (추후 answeredBy 등 확장 가능)
+    const notifyPayload = {
+      questionId:  trimmedQuestionId,
+      answer:      trimmedAnswer,
+      status:      "ANSWERED",
+      answeredAt:  now.getTime(),
+    };
+
+    // 4) 해당 학생에게만 전송 (온라인인 경우)
+    const presence       = getSessionPresence(sessionId);
+    const studentKey     = `student:${question.userId}`;
+    const targetSocketId = presence.get(studentKey);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit(SOCKET_EVENTS.QUESTION_ANSWERED, notifyPayload);
+    }
+    // 오프라인이면 재접속 후 question:list로 복구
+
+    // 5) 교사 룸 전체 broadcast → 교사 화면 즉시 갱신
+    //    요청한 교사 본인도 수신. 프론트는 questionId 기준 idempotent하게 상태 갱신 필요
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.QUESTION_ANSWERED, notifyPayload);
+
+    logger.info("✅ question answered", {
+      sessionId, questionId: trimmedQuestionId,
+      targetUserId: question.userId, online: !!targetSocketId,
     });
   });
 
