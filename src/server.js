@@ -1,6 +1,5 @@
 require('dotenv').config();
 
-const fs = require('fs');
 const path = require('path');
 
 const { logger } = require("./utils/logger");
@@ -10,8 +9,8 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const { PDFDocument, rgb } = require('pdf-lib');
 
-const WHITEBOARD_DIR = path.join(__dirname, '..', 'storage', 'whiteboards');
 const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
+const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -467,7 +466,7 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
       if (session.drawingPath) {
         // ARCHIVED + drawingPath 있음: 파일이 기준 데이터 → 실패 시 명시적 500
         try {
-          const raw = await fs.promises.readFile(session.drawingPath, 'utf8');
+          const raw = await downloadString(session.drawingPath);
           const data = JSON.parse(raw);
           teacherStrokes = Array.isArray(data?.strokes) ? data.strokes : [];
         } catch (e) {
@@ -515,7 +514,10 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     );
     let pdfBuffer;
     try {
-      const pdfRes = await fetch(session.material.url, { signal: fetchController.signal });
+      const pdfFetchUrl = session.material.url.startsWith('http')
+        ? session.material.url                          // 기존 데이터 하위 호환
+        : await getPresignedUrl(session.material.url);  // S3 key → presigned URL
+      const pdfRes = await fetch(pdfFetchUrl, { signal: fetchController.signal });
       if (!pdfRes.ok) {
         return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_FAILED');
       }
@@ -908,15 +910,6 @@ app.delete("/tags/:tagId", requireAuth, requireTeacherRole, async (req, res) => 
   }
 });
 
-// ✅ #93: orphan 파일 cleanup helper
-// multer가 디스크에 먼저 저장하므로, 이후 검증/DB 저장 실패 시 반드시 파일을 삭제해야 함.
-// 삭제 실패도 로그로 관측.
-function safeUnlink(filePath) {
-  if (!filePath) return;
-  fs.unlink(filePath, (err) => {
-    if (err) logger.warn('uploaded file cleanup failed', { filePath, err: err.message });
-  });
-}
 
 // ✅ #93: PDF 수업자료 업로드
 // POST /materials/pdf
@@ -937,11 +930,8 @@ app.post(
       return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'FILE_REQUIRED');
     }
 
-    const filePath = req.file.path;
-
     const classId = (req.body.classId || '').toString().trim();
     if (!classId) {
-      safeUnlink(filePath);
       return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'CLASS_ID_REQUIRED');
     }
 
@@ -953,11 +943,9 @@ app.post(
         select: { id: true, teacherId: true },
       });
       if (!foundClass) {
-        safeUnlink(filePath);
         return sendHttpError(res, 404, ERRORS.CLASS_NOT_FOUND, 'CLASS_NOT_FOUND');
       }
       if (foundClass.teacherId !== req.userId) {
-        safeUnlink(filePath);
         return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_TEACHER');
       }
 
@@ -976,7 +964,6 @@ app.post(
       logger.info('material uploaded', { materialId: material.id, classId });
       return res.status(201).json(material);
     } catch (err) {
-      safeUnlink(filePath);
       logger.error('material upload failed', { err });
       return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
     }
@@ -1347,12 +1334,9 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     });
     const whiteboardData = { strokes };
 
-    // 6. Atomic file write: tmp → rename
-    await fs.promises.mkdir(WHITEBOARD_DIR, { recursive: true });
-    const filePath = path.join(WHITEBOARD_DIR, `${sessionId}.json`);
-    const tmpPath = `${filePath}.tmp`;
-    await fs.promises.writeFile(tmpPath, JSON.stringify(whiteboardData), 'utf8');
-    await fs.promises.rename(tmpPath, filePath);
+    // 6. 판서 JSON S3 저장
+    const s3Key = `whiteboards/${sessionId}.json`;
+    await uploadString(s3Key, JSON.stringify(whiteboardData));
 
     // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
     // ✅ #44: whiteboard와 whiteboardMeta 함께 축소 (meta만 남으면 복원 판단 미묘해짐)
@@ -1367,7 +1351,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       where: { id: sessionId },
       data: {
         status: 'ARCHIVED',
-        drawingPath: filePath,
+        drawingPath: s3Key,
         closedAt,
         endError: null,
       },
@@ -1419,7 +1403,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       sessionId,
       classId: session.classId,
       strokeCount: strokes.length,
-      drawingPath: filePath,
+      drawingPath: s3Key,
     });
 
     return res.json({
@@ -1427,7 +1411,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       sessionId,
       status: 'ARCHIVED',
       strokeCount: strokes.length,
-      drawingPath: filePath,
+      drawingPath: s3Key,
       closedAt,
     });
   } catch (err) {
@@ -1458,7 +1442,7 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       if (!dbSession.drawingPath) {
         return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "DRAWING_NOT_FOUND");
       }
-      const raw = await fs.promises.readFile(dbSession.drawingPath, 'utf8');
+      const raw = await downloadString(dbSession.drawingPath);
       const data = JSON.parse(raw);
       return res.json({ sessionId, readOnly: true, strokes: (data.strokes ?? []).map(normalizeStroke) });
     }
