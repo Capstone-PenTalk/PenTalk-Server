@@ -1,27 +1,12 @@
 // src/upload/uploadStorage.js
-// ✅ #93: PDF 업로드 모듈
-// 디스크 저장은 multer.diskStorage가 담당하고, saveFile()은 저장된 파일의 접근 URL을 생성하는 역할.
-// S3 전환 시: multer storage를 multer-s3로 교체하고 saveFile()에서 S3 URL을 반환하도록 수정.
+// ✅ #108: PDF 업로드를 S3로 변경. material.url에는 S3 key 저장 (URL 아님). 조회 시 presigned URL로 변환.
 
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const { uploadBuffer } = require('../lib/s3');
 
-const PDF_DIR = path.join(__dirname, '..', '..', 'storage', 'pdfs');
 const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
-
-if (!fs.existsSync(PDF_DIR)) {
-  fs.mkdirSync(PDF_DIR, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, PDF_DIR),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${uuidv4()}${ext}`);
-  },
-});
 
 function fileFilter(_req, file, cb) {
   const ext = path.extname(file.originalname).toLowerCase();
@@ -35,17 +20,15 @@ function fileFilter(_req, file, cb) {
   }
 }
 
-// ── URL 생성 ──────────────────────────────────────────────────
-// ⚠️ req.protocol은 nginx/EC2 등 reverse proxy 뒤에서 http로 잘못 잡힐 수 있음.
-//    배포 환경에서는 server.js에 app.set('trust proxy', 1) 설정 여부를 확인할 것.
 async function saveFile(req, file) {
-  const baseUrl = `${req.protocol}://${req.get('host')}`;
-  const url = `${baseUrl}/pdfs/${file.filename}`;
-  return { url };
+  // material.url에는 S3 key를 저장 (URL 아님). 조회 시 presigned URL로 변환.
+  const key = `pdfs/${req.userId}/${uuidv4()}.pdf`;
+  await uploadBuffer(key, file.buffer, 'application/pdf');
+  return { url: key };
 }
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: MAX_FILE_SIZE_BYTES },
 });
