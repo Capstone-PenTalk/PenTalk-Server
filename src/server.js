@@ -1334,9 +1334,19 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     });
     const whiteboardData = { strokes };
 
-    // 6. 판서 JSON S3 저장
+    // 6. 판서 JSON S3 저장 (실패 시 DB ACTIVE 롤백 → 교사 재시도 가능)
     const s3Key = `whiteboards/${sessionId}.json`;
-    await uploadString(s3Key, JSON.stringify(whiteboardData));
+    try {
+      await uploadString(s3Key, JSON.stringify(whiteboardData));
+    } catch (s3Err) {
+      const errorMessage = String(s3Err?.message || s3Err || 'S3_UPLOAD_FAILED').slice(0, 500);
+      await prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'ACTIVE', endError: errorMessage },
+      });
+      logger.error("session end: S3 upload failed, rolled back to ACTIVE", { sessionId, err: errorMessage });
+      return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "SESSION_END_FAILED");
+    }
 
     // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
     // ✅ #44: whiteboard와 whiteboardMeta 함께 축소 (meta만 남으면 복원 판단 미묘해짐)
