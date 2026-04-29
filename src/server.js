@@ -70,6 +70,27 @@ function pageMetaKey(sessionId, materialId, pageNumber) {
   return `whiteboardMeta:${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 }
 
+async function scanPageKeys(sessionId) {
+  // key 구조: whiteboard:{sessionId}:{encodeURIComponent(materialId)}:{pageNumber}
+  // pageWbKey()에서 materialId를 encodeURIComponent로 인코딩하므로 ':' 미포함 보장
+  const pattern = `whiteboard:${sessionId}:*`;
+  const keys = [];
+  let cursor = '0';
+  do {
+    const [newCursor, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = newCursor;
+    for (const key of batch) {
+      // key 수가 많아질 경우 split 비용 증가 가능 (현재 규모에서는 허용)
+      const parts = key.split(':');
+      if (parts.length !== 4) continue;
+      const pageNum = Number(parts[3]);
+      if (!Number.isInteger(pageNum) || pageNum < 1) continue;
+      keys.push(key);
+    }
+  } while (cursor !== '0');
+  return keys;
+}
+
 // ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
 function hexToRgbPdf(hex) {
   let clean = (typeof hex === 'string' ? hex : '#000000').replace('#', '');
@@ -483,21 +504,23 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
       }
       // ARCHIVED + drawingPath null: 판서 없이 저장된 세션 → soft fail, 그대로 진행
     } else {
-      // ACTIVE / CLOSING: Redis 조회 → miss는 soft fail (TTL 만료 등 가능)
+      // ACTIVE / CLOSING: 페이지별 key 스캔 → miss는 soft fail (TTL 만료 등 가능)
       try {
-        const raw = await redis.get(`whiteboard:${sessionId}`);
-        if (raw) {
-          try {
-            const data = JSON.parse(raw);
-            teacherStrokes = Array.isArray(data?.strokes) ? data.strokes : [];
-          } catch (e) {
-            // Redis 파싱 실패: soft fail (교사 판서 없이 진행)
-            logger.warn('export: teacher strokes redis parse failed', { sessionId, err: e?.message });
+        const wbKeys = await scanPageKeys(sessionId);
+        if (wbKeys.length > 0) {
+          const values = await redis.mget(...wbKeys);
+          for (const raw of values) {
+            if (!raw) continue;
+            try {
+              const data = JSON.parse(raw);
+              if (Array.isArray(data?.strokes)) teacherStrokes.push(...data.strokes);
+            } catch (e) {
+              logger.warn('export: teacher strokes redis parse failed', { sessionId, err: e?.message });
+            }
           }
         }
       } catch (e) {
-        // Redis 연결 에러: soft fail (교사 판서 없이 진행)
-        logger.warn('export: redis get failed', { sessionId, err: e?.message });
+        logger.warn('export: redis scan failed', { sessionId, err: e?.message });
       }
     }
 
@@ -562,9 +585,10 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
 
     const strokesByPage = new Map();
     for (const stroke of allStrokes) {
-      const pageNum = stroke.page;
+      // pageNumber: #111 이후 구조 / page: legacy 데이터 하위 호환
+      const pageNum = Number(stroke.pageNumber ?? stroke.page);
       if (!Number.isInteger(pageNum) || pageNum < 1) {
-        logger.warn('export: stroke skipped (invalid page)', { sessionId, page: pageNum });
+        logger.warn('export: stroke skipped (invalid pageNumber)', { sessionId, pageNumber: pageNum });
         continue;
       }
       const pageIdx = pageNum - 1;
@@ -1321,20 +1345,23 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       },
     });
 
-    // 5. Redis에서 판서 데이터 수집 (락으로 스냅샷 일관성 보장)
-    const wbKey = `whiteboard:${sessionId}`;
+    // 5. Redis에서 판서 데이터 수집 (페이지별 key 스캔)
+    // flat strokes 배열로 저장. 각 stroke에 materialId/pageNumber 포함 (#111에서 보장)
+    // CLOSING 상태 이후 archivedSessions로 new write 차단되므로 락 불필요
+    const wbKeys = await scanPageKeys(sessionId);
     let strokes = [];
-    await withWhiteboardLock(sessionId, async () => {
-      const raw = await redis.get(wbKey);
-      if (raw) {
+    if (wbKeys.length > 0) {
+      const values = await redis.mget(...wbKeys);
+      for (const raw of values) {
+        if (!raw) continue;
         try {
           const parsed = JSON.parse(raw);
-          strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+          if (Array.isArray(parsed?.strokes)) strokes.push(...parsed.strokes);
         } catch (e) {
-          logger.warn("invalid whiteboard json in redis", { sessionId, err: e?.message });
+          logger.warn("invalid whiteboard json in redis on session end", { sessionId, err: e?.message });
         }
       }
-    });
+    }
     const whiteboardData = { strokes };
 
     // 6. 판서 JSON S3 저장 (실패 시 DB ACTIVE 롤백 → 교사 재시도 가능)
@@ -1351,12 +1378,16 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "SESSION_END_FAILED");
     }
 
-    // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
-    // ✅ #44: whiteboard와 whiteboardMeta 함께 축소 (meta만 남으면 복원 판단 미묘해짐)
-    await Promise.all([
-      redis.expire(wbKey, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
-      redis.expire(`whiteboardMeta:${sessionId}`, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
-    ]);
+    // 7. 파일 저장 성공 후 모든 page key + meta key에 TTL 설정
+    if (wbKeys.length > 0) {
+      // whiteboard: → whiteboardMeta: prefix 교체 (key 구조 동일)
+      const metaKeys = wbKeys.map(k => k.replace(/^whiteboard:/, 'whiteboardMeta:'));
+      const ttlPipeline = redis.pipeline();
+      for (const key of [...wbKeys, ...metaKeys]) {
+        ttlPipeline.expire(key, APP_CONFIG.WHITEBOARD_TTL_AFTER_END);
+      }
+      await ttlPipeline.exec();
+    }
 
     // 8. DB 상태: CLOSING → ARCHIVED
     const closedAt = new Date();
@@ -2480,7 +2511,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
 
     const wbKey = pageWbKey(sessionId, materialId, pageNumber);
     const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
-    const lockKey = `${sessionId}:${materialId}:${pageNumber}`;
+    const lockKey = `${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
       ...payload,
@@ -2583,6 +2614,13 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         message: "INVALID_DRAW_CLEAR_PAYLOAD",
       });
     }
+    // 프론트는 cl 이벤트에 항상 scope를 포함하므로 "page"만 허용
+    if (payload.e === "cl" && payload.scope !== "page") {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
     if (
       typeof payload.materialId !== "string" || !payload.materialId ||
       !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
@@ -2609,7 +2647,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     const { materialId, pageNumber } = payload;
     const wbKey = pageWbKey(sessionId, materialId, pageNumber);
     const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
-    const lockKey = `${sessionId}:${materialId}:${pageNumber}`;
+    const lockKey = `${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
@@ -2633,7 +2671,9 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
           try {
             const parsed = JSON.parse(rawBoard);
             strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
-          } catch (_) {}
+          } catch (e) {
+            logger.warn("invalid whiteboard json on clear", { sessionId, err: e?.message });
+          }
         }
 
         strokes = payload.e === "cl"
@@ -2654,6 +2694,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       const p = pendingStrokes.get(sessionId);
       if (p) {
         if (payload.e === "cl") {
+          // pendingStrokes는 session당 규모가 작다고 가정하고 선형 탐색 사용
           const suffix = `:${materialId}:${pageNumber}`;
           for (const key of p.keys()) {
             if (key.endsWith(suffix)) p.delete(key);
