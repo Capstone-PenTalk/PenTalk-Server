@@ -1099,6 +1099,31 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
 
 
 
+app.get("/materials/:materialId/download-url", requireAuth, async (req, res) => {
+  const { materialId } = req.params;
+  try {
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { url: true, classId: true },
+    });
+    if (!material) {
+      return sendHttpError(res, 404, ERRORS.MATERIAL_NOT_FOUND, "MATERIAL_NOT_FOUND");
+    }
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: material.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
+    }
+    const url = await getPresignedUrl(material.url);
+    return res.json({ url });
+  } catch (err) {
+    logger.error("download-url failed", { materialId, err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "DOWNLOAD_URL_FAILED");
+  }
+});
+
 app.post("/materials/:materialId/subjects", async (req, res) => {
   const { materialId } = req.params;
   const { subjectIds } = req.body;
