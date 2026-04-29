@@ -1020,7 +1020,7 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
 
     // subject 필터: MaterialSubject 조인 테이블을 통해 필터링
     if (subjectId) {
-      where.subjects = {
+      where.MaterialSubject = {
         some: { subjectId },
       };
     }
@@ -1046,9 +1046,9 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       where,
       orderBy: { createdAt: "desc" },
       include: {
-        subjects: {
+        MaterialSubject: {
           include: {
-            subject: { select: { id: true, name: true } },
+            Subject: { select: { id: true, name: true } },
           },
         },
         MaterialTag: {
@@ -1067,9 +1067,9 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       url: m.url,
       classId: m.classId,
       createdAt: m.createdAt,
-      subjects: (m.subjects || []).map((ms) => ({
-        id: ms.subject.id,
-        name: ms.subject.name,
+      subjects: (m.MaterialSubject || []).map((ms) => ({
+        id: ms.Subject.id,
+        name: ms.Subject.name,
       })),
       tags: (m.MaterialTag || []).map((mt) => ({
         id: mt.Tag.id,
