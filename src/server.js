@@ -56,15 +56,18 @@ const PEN_CONFIG = {
 // ✅ #45: 구형 stroke 데이터(c/w 없음) 정규화
 function normalizeStroke(s) {
   if (!s) return s;
-  const normalized = {
+  return {
     ...s,
     c: (typeof s.c === "string" && PEN_CONFIG.HEX_RE.test(s.c)) ? s.c : PEN_CONFIG.DEFAULT_COLOR,
     w: (typeof s.w === "number" && s.w > 0 && s.w <= PEN_CONFIG.MAX_WIDTH) ? s.w : PEN_CONFIG.DEFAULT_WIDTH,
   };
-  if (!(Number.isInteger(s.page) && s.page >= 1)) {
-    delete normalized.page;
-  }
-  return normalized;
+}
+
+function pageWbKey(sessionId, materialId, pageNumber) {
+  return `whiteboard:${sessionId}:${materialId}:${pageNumber}`;
+}
+function pageMetaKey(sessionId, materialId, pageNumber) {
+  return `whiteboardMeta:${sessionId}:${materialId}:${pageNumber}`;
 }
 
 // ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
@@ -113,7 +116,7 @@ function resolveStrokeWidth(stroke) {
 }
 
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
-// Map<sessionId, Map<sId, {sId, x, y, c, w}>>
+// Map<sessionId, Map<`${sId}:${materialId}:${pageNumber}`, {sId, x, y, c, w, materialId, pageNumber}>>
 const pendingStrokes = new Map();
 
 // ✅ #38: presence 자료구조 (sessionId -> Map(userKey -> socketId))
@@ -189,23 +192,23 @@ const WB_LOCK_RELEASE_SCRIPT = `
     return 0
   end`;
 
-async function withWhiteboardLock(sessionId, fn) {
-  const lockKey = `lock:whiteboard:${sessionId}`;
+async function withWhiteboardLock(lockKey, fn) {
+  const redisLockKey = `lock:whiteboard:${lockKey}`;
   const lockValue = uuidv4();
   for (let attempt = 0; attempt <= WB_LOCK_MAX_RETRIES; attempt++) {
-    const acquired = await redis.set(lockKey, lockValue, "NX", "PX", WB_LOCK_TTL_MS);
+    const acquired = await redis.set(redisLockKey, lockValue, "NX", "PX", WB_LOCK_TTL_MS);
     if (acquired) {
       try {
         return await fn();
       } finally {
-        await redis.eval(WB_LOCK_RELEASE_SCRIPT, 1, lockKey, lockValue);
+        await redis.eval(WB_LOCK_RELEASE_SCRIPT, 1, redisLockKey, lockValue);
       }
     }
     if (attempt < WB_LOCK_MAX_RETRIES) {
       await new Promise((r) => setTimeout(r, WB_LOCK_RETRY_DELAY_MS));
     }
   }
-  throw new Error(`whiteboard lock timeout sessionId=${sessionId}`);
+  throw new Error(`whiteboard lock timeout key=${lockKey}`);
 }
 
 // ✅ #44: room별 draw tick 카운터 (de 이벤트 기준, 재연결 시 Redis meta에서 복원)
@@ -2328,24 +2331,33 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   const { e } = payload;
 
   if (e === "ds") {
-    if (typeof payload.sId !== "number" ||
-        typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
-        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
-        typeof payload.c !== "string" || !PEN_CONFIG.HEX_RE.test(payload.c) ||
-        typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH ||
-      (payload.page !== undefined && (!Number.isInteger(payload.page) || payload.page < 1))) {
+    if (
+      typeof payload.sId !== "number" ||
+      typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
+      typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
+      typeof payload.c !== "string" || !PEN_CONFIG.HEX_RE.test(payload.c) ||
+      typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH ||
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DS_PAYLOAD",
       });
     }
     // ✅ #74: ds 데이터를 pendingStrokes에 임시 보관 (de 완성 시 Redis 저장에 사용)
-    // ✅ #47: page는 stroke 시작 시점(ds) 기준으로 고정
+    // ✅ #111: page → materialId + pageNumber 복합 키로 변경
     const sid = socket.data.roomId;
     if (!pendingStrokes.has(sid)) pendingStrokes.set(sid, new Map());
-    pendingStrokes.get(sid).set(payload.sId, {
-      sId: payload.sId, x: payload.x, y: payload.y, c: payload.c, w: payload.w,
-      ...(Number.isInteger(payload.page) && payload.page >= 1 && { page: payload.page }),
+    const pendingKey = `${payload.sId}:${payload.materialId}:${payload.pageNumber}`;
+    pendingStrokes.get(sid).set(pendingKey, {
+      sId: payload.sId,
+      x: payload.x,
+      y: payload.y,
+      c: payload.c,
+      w: payload.w,
+      materialId: payload.materialId,
+      pageNumber: payload.pageNumber,
     });
   }
 
@@ -2359,7 +2371,11 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   }
 
   if (e === "de") {
-    if (typeof payload.sId !== "number") {
+    if (
+      typeof payload.sId !== "number" ||
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DE_PAYLOAD",
@@ -2391,22 +2407,55 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   }
 
   // ✅ #44: de → tick 발급 후 브로드캐스트 + Redis 저장 (tick은 emit/store 동일값)
+  // ✅ #111: 페이지 단위 key 사용, dsData 없으면 broadcast만 하고 저장 안 함
   if (e === "de") {
     const sessionId = socket.data.roomId;
-    const wbKey = `whiteboard:${sessionId}`;
-    const metaKey = `whiteboardMeta:${sessionId}`;
+    const { materialId, pageNumber } = payload;
 
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
 
-    // ✅ #45: de 브로드캐스트 전에 dsData를 먼저 조회하여 c/w 보완
+    const pendingKey = `${payload.sId}:${materialId}:${pageNumber}`;
     const sessionMap = pendingStrokes.get(sessionId);
-    const dsData = sessionMap?.get(payload.sId);
+    const dsData = sessionMap?.get(pendingKey);
+
+    if (!dsData) {
+      // ds/de 간 materialId/pageNumber 불일치 여부 탐색 (디버깅용)
+      const mismatch = sessionMap
+        ? [...sessionMap.entries()].find(([, v]) => v.sId === payload.sId)
+        : null;
+
+      logger.warn("draw:append 'de' received without matching 'ds'", {
+        sessionId,
+        sId: payload.sId,
+        materialId,
+        pageNumber,
+        userId: socket.data.userId,
+        ...(mismatch && {
+          storedKey: mismatch[0],
+          storedMaterialId: mismatch[1].materialId,
+          storedPageNumber: mismatch[1].pageNumber,
+        }),
+      });
+
+      socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
+        ...payload,
+        senderUserId: socket.data.userId,
+        senderRole: socket.data.role,
+        t: tick,
+        ts,
+      });
+      return;
+    }
+
+    const wbKey = pageWbKey(sessionId, materialId, pageNumber);
+    const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
+    const lockKey = `${sessionId}:${materialId}:${pageNumber}`;
 
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
       ...payload,
-      c: dsData?.c ?? PEN_CONFIG.DEFAULT_COLOR,
-      w: dsData?.w ?? PEN_CONFIG.DEFAULT_WIDTH,
+      c: dsData.c,
+      w: dsData.w,
       senderUserId: socket.data.userId,
       senderRole: socket.data.role,
       t: tick,
@@ -2418,30 +2467,26 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       roomId: sessionId,
       e: payload.e,
       sId: payload.sId,
+      materialId,
+      pageNumber,
       t: tick,
     });
 
     try {
-      if (!dsData) {
-        logger.warn("draw:append 'de' received without 'ds'", {
-          sessionId,
-          sId: payload.sId,
-          userId: socket.data.userId,
-        });
-      }
       const newStroke = {
         sId: payload.sId,
-        x: dsData?.x ?? 0,
-        y: dsData?.y ?? 0,
-        c: dsData?.c ?? PEN_CONFIG.DEFAULT_COLOR,
-        w: dsData?.w ?? PEN_CONFIG.DEFAULT_WIDTH,
+        x: dsData.x,
+        y: dsData.y,
+        c: dsData.c,
+        w: dsData.w,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
         t: tick,
-        ...(dsData?.page !== undefined && { page: dsData.page }),
+        materialId,
+        pageNumber,
       };
 
       // 락 획득 후 GET → parse → upsert → SET (원자적 보장)
-      await withWhiteboardLock(sessionId, async () => {
+      await withWhiteboardLock(lockKey, async () => {
         const [rawBoard, rawMeta] = await Promise.all([
           redis.get(wbKey),
           redis.get(metaKey),
@@ -2477,7 +2522,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         ]);
       });
 
-      pendingStrokes.get(sessionId)?.delete(payload.sId);
+      sessionMap.delete(pendingKey);
     } catch (err) {
       logger.error("whiteboard store update failed", { e, err: err?.message });
     }
@@ -2501,8 +2546,17 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       });
     }
 
-    // cl: sId 불필요 / un, er: sId 필수
+    // cl/un/er 모두 materialId, pageNumber 필수
     if (!payload || (payload.e !== "cl" && payload.e !== "un" && payload.e !== "er")) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
+    if (
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DRAW_CLEAR_PAYLOAD",
@@ -2522,15 +2576,19 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     }
 
     const sessionId = socket.data.roomId;
-    const wbKey = `whiteboard:${sessionId}`;
-    const metaKey = `whiteboardMeta:${sessionId}`;
+    const { materialId, pageNumber } = payload;
+    const wbKey = pageWbKey(sessionId, materialId, pageNumber);
+    const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
+    const lockKey = `${sessionId}:${materialId}:${pageNumber}`;
 
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
 
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_CLEAR, {
       e: payload.e,
-      sId: payload.sId,
+      ...(payload.e !== "cl" && { sId: payload.sId }),
+      materialId,
+      pageNumber,
       senderUserId: socket.data.userId,
       t: tick,
       ts,
@@ -2538,7 +2596,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
 
     try {
       // 락 획득 후 GET → parse → filter/clear → SET (원자적 보장)
-      await withWhiteboardLock(sessionId, async () => {
+      await withWhiteboardLock(lockKey, async () => {
         const rawBoard = await redis.get(wbKey);
         let strokes = [];
         if (rawBoard) {
@@ -2548,11 +2606,9 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
           } catch (_) {}
         }
 
-        if (payload.e === "cl") {
-          strokes = [];
-        } else {
-          strokes = strokes.filter((s) => s.sId !== payload.sId);
-        }
+        strokes = payload.e === "cl"
+          ? []
+          : strokes.filter((s) => s.sId !== payload.sId);
 
         await Promise.all([
           redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
@@ -2564,11 +2620,17 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         ]);
       });
 
-      // cl: pending 전체 정리 / un, er: 해당 sId만 정리
+      // cl: 해당 페이지 pending 정리 / un, er: 해당 sId만 정리
       const p = pendingStrokes.get(sessionId);
       if (p) {
-        if (payload.e === "cl") p.clear();
-        else p.delete(payload.sId);
+        if (payload.e === "cl") {
+          const suffix = `:${materialId}:${pageNumber}`;
+          for (const key of p.keys()) {
+            if (key.endsWith(suffix)) p.delete(key);
+          }
+        } else {
+          p.delete(`${payload.sId}:${materialId}:${pageNumber}`);
+        }
       }
     } catch (err) {
       logger.error("whiteboard clear failed", { err: err?.message });
