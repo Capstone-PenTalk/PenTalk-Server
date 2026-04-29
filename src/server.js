@@ -64,10 +64,10 @@ function normalizeStroke(s) {
 }
 
 function pageWbKey(sessionId, materialId, pageNumber) {
-  return `whiteboard:${sessionId}:${materialId}:${pageNumber}`;
+  return `whiteboard:${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 }
 function pageMetaKey(sessionId, materialId, pageNumber) {
-  return `whiteboardMeta:${sessionId}:${materialId}:${pageNumber}`;
+  return `whiteboardMeta:${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 }
 
 // ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
@@ -1767,8 +1767,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
   });
 
-  // ✅ #44: sync:request (재연결 시 lastTick 기반 delta 또는 full sync)
-  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async ({ lastTick } = {}) => {
+  // ✅ #112: sync:request (페이지 단위, lastTick 기반 delta 또는 full sync)
+  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async ({ materialId, pageNumber, lastTick } = {}) => {
     if (!requireJoined(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.NOT_JOINED,
@@ -1776,13 +1776,31 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       });
     }
 
-    const roomId = socket.data.roomId;
-    const wbKey = `whiteboard:${roomId}`;
-    const metaKey = `whiteboardMeta:${roomId}`;
+    const normalizedMaterialId =
+      typeof materialId === "string" ? materialId.trim() : "";
+    const normalizedPageNumber = Number(pageNumber);
 
-    // 정수 + 0 이상만 유효 (NaN, 음수, 소수 제외)
+    if (
+      !normalizedMaterialId ||
+      !Number.isInteger(normalizedPageNumber) ||
+      normalizedPageNumber < 1
+    ) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_SYNC_REQUEST",
+      });
+    }
+
+    const roomId = socket.data.roomId;
+    const wbKey = pageWbKey(roomId, normalizedMaterialId, normalizedPageNumber);
+    const metaKey = pageMetaKey(roomId, normalizedMaterialId, normalizedPageNumber);
+
+    const normalizedLastTick =
+      lastTick === undefined || lastTick === null ? null : Number(lastTick);
     const clientLastTick =
-      Number.isInteger(lastTick) && lastTick >= 0 ? lastTick : null;
+      Number.isInteger(normalizedLastTick) && normalizedLastTick >= 0
+        ? normalizedLastTick
+        : null;
 
     try {
       const [rawBoard, rawMeta] = await Promise.all([
@@ -1796,11 +1814,14 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
           const parsed = JSON.parse(rawBoard);
           strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
         } catch (e) {
-          logger.warn("invalid whiteboard json on sync", { roomId, err: e?.message });
+          logger.warn("invalid whiteboard json on sync", {
+            roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber,
+            err: e?.message,
+          });
         }
       }
 
-      // meta 파싱 실패 시 보수적으로 hasDestructiveChange: true
+      // meta 파싱 실패 시 보수적으로 hasDestructiveChange: true → 항상 full sync
       let meta = { serverTick: 0, hasDestructiveChange: true };
       if (rawMeta) {
         try {
@@ -1811,7 +1832,10 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
             updatedAt: parsed?.updatedAt ?? 0,
           };
         } catch (e) {
-          logger.warn("invalid whiteboard meta json on sync", { roomId, err: e?.message });
+          logger.warn("invalid whiteboard meta json on sync", {
+            roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber,
+            err: e?.message,
+          });
         }
       }
 
@@ -1833,11 +1857,12 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         strokes: payloadStrokes.map(normalizeStroke),
         mode,
         serverTick: meta.serverTick,
+        materialId: normalizedMaterialId,
+        pageNumber: normalizedPageNumber,
       });
 
       logger.info("sync:state sent", {
-        roomId,
-        mode,
+        roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber, mode,
         total: strokes.length,
         delta: payloadStrokes.length,
         clientLastTick,
@@ -1846,7 +1871,12 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         redisMiss: rawBoard === null,
       });
     } catch (err) {
-      logger.error("sync:state failed", { err: err?.message });
+      logger.error("sync:state failed", {
+        roomId,
+        materialId: normalizedMaterialId,
+        pageNumber: normalizedPageNumber,
+        err: err?.message,
+      });
       socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.INTERNAL_ERROR,
         message: "SYNC_FAILED",
