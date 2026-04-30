@@ -1064,6 +1064,7 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
     const formatted = items.map((m) => ({
       id: m.id,
       type: m.type,
+      name: m.name,
       url: m.url,
       classId: m.classId,
       createdAt: m.createdAt,
