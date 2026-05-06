@@ -1,0 +1,1 @@
+ALTER TABLE "Question" ADD COLUMN "isAnonymous" BOOLEAN NOT NULL DEFAULT false;

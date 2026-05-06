@@ -14,6 +14,23 @@ const SOCKET_EVENTS = {
   PRESENCE_JOIN: 'presence:join',
   PRESENCE_LEAVE: 'presence:leave',
   PRESENCE_STATE: 'presence:state',
+
+  // ✅ #51
+  POLL_START:   'poll:start',
+  POLL_END:     'poll:end',
+  POLL_ANSWER:  'poll:answer',
+  POLL_RESULT:  'poll:result',
+
+  // ✅ #54
+  QUESTION_ASK:         'question:ask',
+  QUESTION_ACK:         'question:ack',
+  QUESTION_NEW:         'question:new',
+  QUESTION_LIST:        'question:list',
+  QUESTION_LIST_RESULT: 'question:list:result',
+
+  // ✅ #56
+  QUESTION_ANSWER:   'question:answer',    // 교사 → 서버 (요청)
+  QUESTION_ANSWERED: 'question:answered',  // 서버 → 클라이언트 (통지)
 };
 
 module.exports = { SOCKET_EVENTS };
