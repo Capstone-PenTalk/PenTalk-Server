@@ -24,18 +24,42 @@
 | 실시간 통신 | Socket.IO 4 |
 | DB | PostgreSQL + Prisma 6 |
 | Cache / Pub-Sub | Redis (ioredis) |
+| Storage | AWS S3 |
 | 인증 | JWT |
+| PDF | pdf-lib |
 
 ---
 
 ## 빠른 시작
+
+### Docker Compose (권장)
+
+Redis, PostgreSQL, Node.js 서버를 한 번에 실행합니다.
+
+```bash
+# 1. 환경 변수 설정
+cp .env.example .env
+# .env 파일에 필요한 값 입력 후 저장
+
+# 2. 전체 서비스 실행
+docker-compose up --build
+
+# 3. DB 마이그레이션 (최초 1회 또는 스키마 변경 시)
+docker-compose exec app npx prisma migrate deploy
+```
+
+서버: `http://localhost:3000`
+
+---
+
+### 로컬 직접 실행 (개발용)
 
 ```bash
 # 1. 의존성 설치
 npm install
 
 # 2. 환경 변수 설정
-cp .env.example .env  # 없으면 아래 참고
+cp .env.example .env
 
 # 3. DB 마이그레이션
 npx prisma migrate dev
