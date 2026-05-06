@@ -1,6 +1,5 @@
 require('dotenv').config();
 
-const fs = require('fs');
 const path = require('path');
 
 const { logger } = require("./utils/logger");
@@ -8,8 +7,10 @@ const { ERRORS } = require("../config/errors");
 const { sendHttpError } = require("./utils/httpError");
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const { PDFDocument, rgb } = require('pdf-lib');
 
-const WHITEBOARD_DIR = path.join(__dirname, '..', 'storage', 'whiteboards');
+const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
+const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -28,11 +29,115 @@ const sessionStore = require('./store/sessionStore');
 const { signToken, verifyToken } = require('./utils/jwt');
 const { pubClient, subClient } = require("./lib/redisPubSub");
 const redis = require("./lib/redis");
+const { randomUUID } = require("crypto");
 const MAX_MESSAGE_LEN = 300;
+const MAX_POLL_DURATION = 300;     // ✅ #51: 투표 최대 지속 시간 (초)
+const MAX_QUESTION_LENGTH = 500;   // ✅ #54: 질문 최대 길이 (자)
+const MAX_ANSWER_LENGTH   = 1000;  // ✅ #56: 답변 최대 길이 (자)
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
+// ✅ #61: export 제한값
+const EXPORT_CONFIG = {
+  MAX_STUDENT_STROKES: 3000,    // 학생 필기 최대 stroke 수
+  MAX_POINTS_PER_STROKE: 1000,  // stroke당 최대 point 수 (렌더링 단계에서 slice)
+  MAX_TOTAL_POINTS: 50_000,     // 전체 point 수 상한 (메모리/CPU 보호)
+  PDF_FETCH_TIMEOUT_MS: 10_000, // 원본 PDF fetch timeout (ms)
+  // 전체 export timeout은 nginx 레벨에서 제어
+};
+
+// ✅ #45: 펜 스타일 설정 상수
+const PEN_CONFIG = {
+  DEFAULT_COLOR: "#000000",
+  DEFAULT_WIDTH: 2,
+  MAX_WIDTH: 50, // 프론트 UI 펜 굵기 허용 범위 상한 (픽셀 기준)
+  HEX_RE: /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/,
+};
+
+// ✅ #45: 구형 stroke 데이터(c/w 없음) 정규화
+function normalizeStroke(s) {
+  if (!s) return s;
+  return {
+    ...s,
+    c: (typeof s.c === "string" && PEN_CONFIG.HEX_RE.test(s.c)) ? s.c : PEN_CONFIG.DEFAULT_COLOR,
+    w: (typeof s.w === "number" && s.w > 0 && s.w <= PEN_CONFIG.MAX_WIDTH) ? s.w : PEN_CONFIG.DEFAULT_WIDTH,
+  };
+}
+
+function pageWbKey(sessionId, materialId, pageNumber) {
+  return `whiteboard:${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
+}
+function pageMetaKey(sessionId, materialId, pageNumber) {
+  return `whiteboardMeta:${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
+}
+
+async function scanPageKeys(sessionId) {
+  // key 구조: whiteboard:{sessionId}:{encodeURIComponent(materialId)}:{pageNumber}
+  // pageWbKey()에서 materialId를 encodeURIComponent로 인코딩하므로 ':' 미포함 보장
+  const pattern = `whiteboard:${sessionId}:*`;
+  const keys = [];
+  let cursor = '0';
+  do {
+    const [newCursor, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    cursor = newCursor;
+    for (const key of batch) {
+      // key 수가 많아질 경우 split 비용 증가 가능 (현재 규모에서는 허용)
+      const parts = key.split(':');
+      if (parts.length !== 4) continue;
+      const pageNum = Number(parts[3]);
+      if (!Number.isInteger(pageNum) || pageNum < 1) continue;
+      keys.push(key);
+    }
+  } while (cursor !== '0');
+  return keys;
+}
+
+// ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
+function hexToRgbPdf(hex) {
+  let clean = (typeof hex === 'string' ? hex : '#000000').replace('#', '');
+  if (clean.length === 3) {
+    clean = clean[0]+clean[0]+clean[1]+clean[1]+clean[2]+clean[2];
+  }
+  if (clean.length !== 6 || !/^[0-9a-fA-F]{6}$/.test(clean)) return rgb(0, 0, 0);
+  return rgb(
+    parseInt(clean.slice(0, 2), 16) / 255,
+    parseInt(clean.slice(2, 4), 16) / 255,
+    parseInt(clean.slice(4, 6), 16) / 255,
+  );
+}
+
+// ✅ #61: Flutter Color.value (ARGB int) → pdf-lib rgb 변환
+function argbIntToRgbPdf(argb) {
+  const v = argb >>> 0;
+  return rgb(
+    ((v >> 16) & 0xFF) / 255,
+    ((v >> 8)  & 0xFF) / 255,
+    (v         & 0xFF) / 255,
+  );
+}
+
+// ✅ #61: stroke color 필드 정규화 (hex string 또는 Flutter ARGB int 모두 처리)
+function resolveStrokeColor(stroke) {
+  // hex string: c 필드 (서버 저장 형식)
+  if (typeof stroke.c === 'string' && PEN_CONFIG.HEX_RE.test(stroke.c)) {
+    return hexToRgbPdf(stroke.c);
+  }
+  // Flutter Color.value int: color 필드 (클라이언트 미변환 시 방어)
+  if (typeof stroke.color === 'number' && Number.isInteger(stroke.color)) {
+    return argbIntToRgbPdf(stroke.color);
+  }
+  return rgb(0, 0, 0);
+}
+
+// ✅ #61: stroke width 필드 정규화 (w 또는 width 모두 처리)
+function resolveStrokeWidth(stroke) {
+  const w = stroke.w ?? stroke.width;
+  return (typeof w === 'number' && w > 0 && w <= PEN_CONFIG.MAX_WIDTH)
+    ? w
+    : PEN_CONFIG.DEFAULT_WIDTH;
+}
+
 // ✅ #74: room별 진행 중인 stroke 임시 저장 (ds → de 완성 전까지)
-// Map<sessionId, Map<sId, {sId, x, y, c, w}>>
+// Map<sessionId, Map<`${sId}:${materialId}:${pageNumber}`, {sId, x, y, c, w, materialId, pageNumber}>>
 const pendingStrokes = new Map();
 
 // ✅ #38: presence 자료구조 (sessionId -> Map(userKey -> socketId))
@@ -40,6 +145,18 @@ const presenceBySession = new Map();
 
 // ✅ #42: 종료된 세션 Set (draw 이벤트 차단용)
 const archivedSessions = new Set();
+
+// ✅ #51: 세션별 진행 중인 투표 상태
+// sessionId → {
+//   pollId, question, options, duration,
+//   startedAt, startedBy,
+//   answers: Map(userId → optionId),
+//   counts: { [optionId]: number },
+//   timer: TimeoutId | null
+// }
+// ※ studentsRoom / teachersRoom은 저장하지 않음.
+//   endPoll은 setTimeout에서 호출될 수 있으므로 getRoleRooms(sessionId)로 직접 계산.
+const activePolls = new Map();
 
 function userKeyOf(socket) {
   return `${socket.data.role}:${socket.data.userId}`;
@@ -96,23 +213,23 @@ const WB_LOCK_RELEASE_SCRIPT = `
     return 0
   end`;
 
-async function withWhiteboardLock(sessionId, fn) {
-  const lockKey = `lock:whiteboard:${sessionId}`;
+async function withWhiteboardLock(lockKey, fn) {
+  const redisLockKey = `lock:whiteboard:${lockKey}`;
   const lockValue = uuidv4();
   for (let attempt = 0; attempt <= WB_LOCK_MAX_RETRIES; attempt++) {
-    const acquired = await redis.set(lockKey, lockValue, "NX", "PX", WB_LOCK_TTL_MS);
+    const acquired = await redis.set(redisLockKey, lockValue, "NX", "PX", WB_LOCK_TTL_MS);
     if (acquired) {
       try {
         return await fn();
       } finally {
-        await redis.eval(WB_LOCK_RELEASE_SCRIPT, 1, lockKey, lockValue);
+        await redis.eval(WB_LOCK_RELEASE_SCRIPT, 1, redisLockKey, lockValue);
       }
     }
     if (attempt < WB_LOCK_MAX_RETRIES) {
       await new Promise((r) => setTimeout(r, WB_LOCK_RETRY_DELAY_MS));
     }
   }
-  throw new Error(`whiteboard lock timeout sessionId=${sessionId}`);
+  throw new Error(`whiteboard lock timeout key=${lockKey}`);
 }
 
 // ✅ #44: room별 draw tick 카운터 (de 이벤트 기준, 재연결 시 Redis meta에서 복원)
@@ -156,8 +273,59 @@ function requireTeacher(socket) {
   return socket.data.role === "teacher";
 }
 
+// ✅ #51
+function requireStudent(socket) {
+  return socket.data.role === "student";
+}
+
 function requireJoined(socket) {
   return !!socket.currentRoom && !!socket.data.roomId && !!socket.data.classId;
+}
+
+// ✅ #51: option 배열 유효성 검사
+// - 2~4개, id는 string|number, text는 비어있지 않은 문자열, id 중복 없음
+function isValidPollOptions(options) {
+  if (!Array.isArray(options) || options.length < 2 || options.length > 4) return false;
+  const seenIds = new Set();
+  for (const o of options) {
+    if (typeof o.id !== "string" && typeof o.id !== "number") return false;
+    if (typeof o.text !== "string" || !o.text.trim()) return false;
+    if (seenIds.has(o.id)) return false;
+    seenIds.add(o.id);
+  }
+  return true;
+}
+
+/// ✅ #55: 익명 여부에 따라 askedBy 구성
+// userId: null → 익명 사용자 (프론트에서 "익명" 등으로 표시). 문구/아이콘 결정은 클라이언트 담당
+function resolveAskedBy(userId, isAnonymous) {
+  return isAnonymous
+    ? { userId: null, isAnonymous: true }
+    : { userId, isAnonymous: false };
+}
+
+// ✅ #51: 투표 종료 공통 처리 (타이머 만료 / 교사 조기 종료 / 세션 종료 모두 이 경로)
+function endPoll(io, sessionId) {
+  const poll = activePolls.get(sessionId);
+  if (!poll) return;
+
+  // 중복 종료 방지를 위해 상태 삭제를 브로드캐스트보다 먼저 수행
+  if (poll.timer) clearTimeout(poll.timer);
+  activePolls.delete(sessionId);
+
+  const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+
+  io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.POLL_END, {
+    pollId: poll.pollId,
+    counts: { ...poll.counts },
+    total: poll.answers.size,
+  });
+
+  logger.info("📊 poll ended", {
+    sessionId,
+    pollId: poll.pollId,
+    total: poll.answers.size,
+  });
 }
 
 const app = express();
@@ -263,6 +431,249 @@ io.use((socket, next) => {
 app.use(cors({
   origin: APP_CONFIG.CORS_ORIGIN,
 }));
+
+// ✅ #93: 업로드된 PDF 정적 파일 서빙
+// ⚠️ 현재 인증 없이 URL만 알면 누구나 접근 가능. 향후 S3 전환 시 signed URL로 대체 예정.
+app.use('/pdfs', express.static(path.join(__dirname, '..', 'storage', 'pdfs')));
+
+// ✅ #61: PDF export
+// global body parser(100kb) 적용 전 실행되도록 app.use(express.json()) 앞에 위치
+app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req, res) => {
+  const exportStart = Date.now();
+  try {
+    const { sessionId, strokes: rawStudentStrokes } = req.body;
+
+    // ── 1. 입력 검증 ──────────────────────────────────────────────
+    if (!sessionId || typeof sessionId !== 'string') {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_ID_REQUIRED');
+    }
+    // strokes 없으면 [] 처리 / 있는데 배열 아니면 400
+    if (rawStudentStrokes !== undefined && !Array.isArray(rawStudentStrokes)) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'STROKES_MUST_BE_ARRAY');
+    }
+    const studentStrokes = rawStudentStrokes ?? [];
+    if (studentStrokes.length > EXPORT_CONFIG.MAX_STUDENT_STROKES) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'TOO_MANY_STROKES');
+    }
+    const totalPoints = studentStrokes.reduce((sum, s) => sum + (Array.isArray(s?.points) ? s.points.length : 0), 0);
+    if (totalPoints > EXPORT_CONFIG.MAX_TOTAL_POINTS) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'TOO_MANY_POINTS');
+    }
+
+    // ── 2. 세션 + material 조회 ───────────────────────────────────
+    const session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      include: { material: { select: { url: true } } },
+    });
+    if (!session) {
+      return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+    }
+    if (!session.material?.url) {
+      return sendHttpError(res, 400, ERRORS.MATERIAL_NOT_FOUND, 'MATERIAL_NOT_FOUND');
+    }
+
+    // ── 3. 권한 검증: 세션 소속 클래스 멤버인지 확인 ──────────────
+    // 현재 정책: classMember 확인 (teacher/student 구분 없이 동일 엔드포인트)
+    // session-level 참가 이력 검증은 이번 범위 외
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
+    }
+
+    // ── 4. 교사 판서 읽기 ─────────────────────────────────────────
+    let teacherStrokes = [];
+
+    if (session.status === 'ARCHIVED') {
+      if (session.drawingPath) {
+        // ARCHIVED + drawingPath 있음: 파일이 기준 데이터 → 실패 시 명시적 500
+        try {
+          const raw = await downloadString(session.drawingPath);
+          const data = JSON.parse(raw);
+          teacherStrokes = Array.isArray(data?.strokes) ? data.strokes : [];
+        } catch (e) {
+          logger.error('export: archived teacher strokes file read failed', {
+            sessionId,
+            drawingPath: session.drawingPath,
+            err: e?.message,
+          });
+          return sendHttpError(res, 500, ERRORS.PDF_EXPORT_FAILED, 'TEACHER_STROKES_UNAVAILABLE');
+        }
+      }
+      // ARCHIVED + drawingPath null: 판서 없이 저장된 세션 → soft fail, 그대로 진행
+    } else {
+      // ACTIVE / CLOSING: 페이지별 key 스캔 → miss는 soft fail (TTL 만료 등 가능)
+      try {
+        const wbKeys = await scanPageKeys(sessionId);
+        if (wbKeys.length > 0) {
+          const values = await redis.mget(...wbKeys);
+          for (const raw of values) {
+            if (!raw) continue;
+            try {
+              const data = JSON.parse(raw);
+              if (Array.isArray(data?.strokes)) teacherStrokes.push(...data.strokes);
+            } catch (e) {
+              logger.warn('export: teacher strokes redis parse failed', { sessionId, err: e?.message });
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn('export: redis scan failed', { sessionId, err: e?.message });
+      }
+    }
+
+    // 기존 normalizeStroke 규칙 적용 (c/w/page 누락된 legacy 데이터 보정)
+    teacherStrokes = teacherStrokes.map(normalizeStroke);
+
+    // tick 오름차순 정렬 (t 없는 legacy stroke는 0 취급 → 앞쪽 배치)
+    // t가 없는 데이터는 정확한 순서를 알 수 없으므로 유효 tick stroke 앞에 배치
+    teacherStrokes.sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+
+    // ── 5. 원본 PDF fetch (timeout 포함) ──────────────────────────
+    // 현재는 material.url 직접 fetch. 추후 스토리지 서명 URL 유틸로 분리 가능.
+    const fetchController = new AbortController();
+    const fetchTimeout = setTimeout(
+      () => fetchController.abort(),
+      EXPORT_CONFIG.PDF_FETCH_TIMEOUT_MS,
+    );
+    let pdfBuffer;
+    try {
+      const pdfFetchUrl = session.material.url.startsWith('http')
+        ? session.material.url                          // 기존 데이터 하위 호환
+        : await getPresignedUrl(session.material.url);  // S3 key → presigned URL
+      const pdfRes = await fetch(pdfFetchUrl, { signal: fetchController.signal });
+      if (!pdfRes.ok) {
+        return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_FAILED');
+      }
+      pdfBuffer = Buffer.from(await pdfRes.arrayBuffer());
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        return sendHttpError(res, 504, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_TIMEOUT');
+      }
+      return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_FETCH_FAILED');
+    } finally {
+      clearTimeout(fetchTimeout);
+    }
+
+    // ── 6. PDF 로드 ───────────────────────────────────────────────
+    let pdfDoc;
+    try {
+      pdfDoc = await PDFDocument.load(pdfBuffer);
+    } catch (e) {
+      logger.warn('export: pdf-lib load failed', { sessionId, err: e?.message });
+      return sendHttpError(res, 502, ERRORS.PDF_FETCH_FAILED, 'PDF_INVALID');
+    }
+    const totalPages = pdfDoc.getPageCount();
+
+    // ── 7. 학생 stroke 1차 필터링 ────────────────────────────────
+    // - points 1개 이하: 선분 불가 → skip
+    // - tool === 'eraser': skip (클라이언트가 이미 제거 후 전송하므로 방어적 처리)
+    // page 범위/좌표 유효성은 렌더링 단계(2차)에서 처리
+    const validStudentStrokes = studentStrokes.filter(s =>
+      s &&
+      Array.isArray(s.points) &&
+      s.points.length > 1 &&
+      s.tool !== 'eraser'
+    );
+
+    // ── 8. 렌더링 순서 결정 및 page별 그룹핑 ─────────────────────
+    // 교사 판서(tick 오름차순) → 학생 필기(body 순서)
+    // 학생 필기가 항상 교사 판서 위에 렌더링됨
+    const allStrokes = [...teacherStrokes, ...validStudentStrokes];
+
+    const strokesByPage = new Map();
+    for (const stroke of allStrokes) {
+      // pageNumber: #111 이후 구조 / page: legacy 데이터 하위 호환
+      const pageNum = Number(stroke.pageNumber ?? stroke.page);
+      if (!Number.isInteger(pageNum) || pageNum < 1) {
+        logger.warn('export: stroke skipped (invalid pageNumber)', { sessionId, pageNumber: pageNum });
+        continue;
+      }
+      const pageIdx = pageNum - 1;
+      if (pageIdx >= totalPages) {
+        logger.warn('export: stroke skipped (page out of range)', { sessionId, pageNum, totalPages });
+        continue;
+      }
+      if (!strokesByPage.has(pageIdx)) strokesByPage.set(pageIdx, []);
+      strokesByPage.get(pageIdx).push(stroke);
+    }
+
+    // ── 9. 판서 합성 ──────────────────────────────────────────────
+    for (const [pageIdx, strokes] of strokesByPage) {
+      const page = pdfDoc.getPage(pageIdx);
+      const { width: pageW, height: pageH } = page.getSize();
+
+      for (const stroke of strokes) {
+        const color = resolveStrokeColor(stroke);
+        const baseWidth = resolveStrokeWidth(stroke);
+        const pts = stroke.points.slice(0, EXPORT_CONFIG.MAX_POINTS_PER_STROKE);
+
+        for (let i = 0; i < pts.length - 1; i++) {
+          const p1 = pts[i];
+          const p2 = pts[i + 1];
+
+          // NaN / Infinity / 비숫자 좌표: 해당 선분만 skip
+          if (
+            typeof p1.x !== 'number' || !isFinite(p1.x) ||
+            typeof p1.y !== 'number' || !isFinite(p1.y) ||
+            typeof p2.x !== 'number' || !isFinite(p2.x) ||
+            typeof p2.y !== 'number' || !isFinite(p2.y)
+          ) continue;
+
+          // 0~1 범위 벗어난 좌표: skip 대신 clamp
+          const x1 = Math.min(1, Math.max(0, p1.x));
+          const y1 = Math.min(1, Math.max(0, p1.y));
+          const x2 = Math.min(1, Math.max(0, p2.x));
+          const y2 = Math.min(1, Math.max(0, p2.y));
+
+          // 필압 적용: p=0 → 0.5배, p=1 → 1.0배
+          const pressure = typeof p1.p === 'number' && isFinite(p1.p)
+            ? Math.min(1, Math.max(0, p1.p))
+            : 0.5;
+          const thickness = baseWidth * (0.5 + pressure * 0.5);
+
+          // 좌표 변환: 정규화(0~1) → PDF pt
+          // y축 반전: Flutter 좌상단 원점(y↓) → PDF 좌하단 원점(y↑)
+          page.drawLine({
+            start: { x: x1 * pageW, y: (1 - y1) * pageH },
+            end:   { x: x2 * pageW, y: (1 - y2) * pageH },
+            thickness,
+            color,
+            opacity: 1,
+          });
+        }
+      }
+    }
+
+    // ── 10. PDF 반환 ──────────────────────────────────────────────
+    const pdfBytes = await pdfDoc.save();
+    const buf = Buffer.from(pdfBytes);
+
+    // 파일명은 sessionId 기반 (한글 파일명 인코딩 문제 방지)
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="export_${sessionId}.pdf"`);
+    res.setHeader('Content-Length', buf.length);
+    res.send(buf);
+
+    logger.info('pdf export success', {
+      sessionId,
+      userId: req.userId,
+      teacherStrokeCount: teacherStrokes.length,
+      studentStrokeCount: validStudentStrokes.length,
+      totalPages,
+      durationMs: Date.now() - exportStart,
+    });
+
+  } catch (err) {
+    const sid = req?.body?.sessionId ?? null;
+    logger.error('pdf export failed', { sessionId: sid, err: err?.message });
+    if (!res.headersSent) {
+      return sendHttpError(res, 500, ERRORS.PDF_EXPORT_FAILED, 'PDF_EXPORT_FAILED');
+    }
+  }
+});
 
 app.use(express.json());
 app.use(express.static(APP_CONFIG.STATIC_DIR));
@@ -526,6 +937,66 @@ app.delete("/tags/:tagId", requireAuth, requireTeacherRole, async (req, res) => 
   }
 });
 
+
+// ✅ #93: PDF 수업자료 업로드
+// POST /materials/pdf
+// multipart/form-data: file(pdf 파일), classId(string)
+app.post(
+  ROUTES.MATERIAL_UPLOAD,
+  requireAuth,
+  requireTeacherRole,
+  // multer 에러(FILE_TYPE_INVALID, LIMIT_FILE_SIZE)를 next(err)로 전달하기 위해 콜백 패턴 사용
+  (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+      if (err) return next(err);
+      next();
+    });
+  },
+  async (req, res) => {
+    if (!req.file) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'FILE_REQUIRED');
+    }
+
+    const classId = (req.body.classId || '').toString().trim();
+    if (!classId) {
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'CLASS_ID_REQUIRED');
+    }
+
+    // classId 검증부터 prisma.create까지 하나의 try로 묶음.
+    // findUnique 포함 DB 접근에서 예외가 나도 cleanup이 보장됨.
+    try {
+      const foundClass = await prisma.class.findUnique({
+        where: { id: classId },
+        select: { id: true, teacherId: true },
+      });
+      if (!foundClass) {
+        return sendHttpError(res, 404, ERRORS.CLASS_NOT_FOUND, 'CLASS_NOT_FOUND');
+      }
+      if (foundClass.teacherId !== req.userId) {
+        return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_TEACHER');
+      }
+
+      const { url } = await saveFile(req, req.file);
+
+      const material = await prisma.material.create({
+        data: {
+          type: 'pdf',
+          url,
+          name: req.file.originalname,
+          classId,
+        },
+        select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
+      });
+
+      logger.info('material uploaded', { materialId: material.id, classId });
+      return res.status(201).json(material);
+    } catch (err) {
+      logger.error('material upload failed', { err });
+      return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
+    }
+  }
+);
+
 /**
  * GET /materials?classId=&subjectId=&tagId=&keyword=
  *
@@ -549,7 +1020,7 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
 
     // subject 필터: MaterialSubject 조인 테이블을 통해 필터링
     if (subjectId) {
-      where.subjects = {
+      where.MaterialSubject = {
         some: { subjectId },
       };
     }
@@ -575,9 +1046,9 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
       where,
       orderBy: { createdAt: "desc" },
       include: {
-        subjects: {
+        MaterialSubject: {
           include: {
-            subject: { select: { id: true, name: true } },
+            Subject: { select: { id: true, name: true } },
           },
         },
         MaterialTag: {
@@ -593,12 +1064,13 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
     const formatted = items.map((m) => ({
       id: m.id,
       type: m.type,
+      name: m.name,
       url: m.url,
       classId: m.classId,
       createdAt: m.createdAt,
-      subjects: (m.subjects || []).map((ms) => ({
-        id: ms.subject.id,
-        name: ms.subject.name,
+      subjects: (m.MaterialSubject || []).map((ms) => ({
+        id: ms.Subject.id,
+        name: ms.Subject.name,
       })),
       tags: (m.MaterialTag || []).map((mt) => ({
         id: mt.Tag.id,
@@ -627,6 +1099,31 @@ app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
 });
 
 
+
+app.get("/materials/:materialId/download-url", requireAuth, async (req, res) => {
+  const { materialId } = req.params;
+  try {
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { url: true, classId: true },
+    });
+    if (!material) {
+      return sendHttpError(res, 404, ERRORS.MATERIAL_NOT_FOUND, "MATERIAL_NOT_FOUND");
+    }
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: material.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
+    }
+    const url = await getPresignedUrl(material.url);
+    return res.json({ url });
+  } catch (err) {
+    logger.error("download-url failed", { materialId, err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "DOWNLOAD_URL_FAILED");
+  }
+});
 
 app.post("/materials/:materialId/subjects", async (req, res) => {
   const { materialId } = req.params;
@@ -874,35 +1371,49 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       },
     });
 
-    // 5. Redis에서 판서 데이터 수집 (락으로 스냅샷 일관성 보장)
-    const wbKey = `whiteboard:${sessionId}`;
+    // 5. Redis에서 판서 데이터 수집 (페이지별 key 스캔)
+    // flat strokes 배열로 저장. 각 stroke에 materialId/pageNumber 포함 (#111에서 보장)
+    // CLOSING 상태 이후 archivedSessions로 new write 차단되므로 락 불필요
+    const wbKeys = await scanPageKeys(sessionId);
     let strokes = [];
-    await withWhiteboardLock(sessionId, async () => {
-      const raw = await redis.get(wbKey);
-      if (raw) {
+    if (wbKeys.length > 0) {
+      const values = await redis.mget(...wbKeys);
+      for (const raw of values) {
+        if (!raw) continue;
         try {
           const parsed = JSON.parse(raw);
-          strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
+          if (Array.isArray(parsed?.strokes)) strokes.push(...parsed.strokes);
         } catch (e) {
-          logger.warn("invalid whiteboard json in redis", { sessionId, err: e?.message });
+          logger.warn("invalid whiteboard json in redis on session end", { sessionId, err: e?.message });
         }
       }
-    });
+    }
     const whiteboardData = { strokes };
 
-    // 6. Atomic file write: tmp → rename
-    await fs.promises.mkdir(WHITEBOARD_DIR, { recursive: true });
-    const filePath = path.join(WHITEBOARD_DIR, `${sessionId}.json`);
-    const tmpPath = `${filePath}.tmp`;
-    await fs.promises.writeFile(tmpPath, JSON.stringify(whiteboardData), 'utf8');
-    await fs.promises.rename(tmpPath, filePath);
+    // 6. 판서 JSON S3 저장 (실패 시 DB ACTIVE 롤백 → 교사 재시도 가능)
+    const s3Key = `whiteboards/${sessionId}.json`;
+    try {
+      await uploadString(s3Key, JSON.stringify(whiteboardData));
+    } catch (s3Err) {
+      const errorMessage = String(s3Err?.message || s3Err || 'S3_UPLOAD_FAILED').slice(0, 500);
+      await prisma.session.update({
+        where: { id: sessionId },
+        data: { status: 'ACTIVE', endError: errorMessage },
+      });
+      logger.error("session end: S3 upload failed, rolled back to ACTIVE", { sessionId, err: errorMessage });
+      return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "SESSION_END_FAILED");
+    }
 
-    // 7. 파일 저장 성공 후 Redis TTL 설정 (즉시 DEL 하지 않음)
-    // ✅ #44: whiteboard와 whiteboardMeta 함께 축소 (meta만 남으면 복원 판단 미묘해짐)
-    await Promise.all([
-      redis.expire(wbKey, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
-      redis.expire(`whiteboardMeta:${sessionId}`, APP_CONFIG.WHITEBOARD_TTL_AFTER_END),
-    ]);
+    // 7. 파일 저장 성공 후 모든 page key + meta key에 TTL 설정
+    if (wbKeys.length > 0) {
+      // whiteboard: → whiteboardMeta: prefix 교체 (key 구조 동일)
+      const metaKeys = wbKeys.map(k => k.replace(/^whiteboard:/, 'whiteboardMeta:'));
+      const ttlPipeline = redis.pipeline();
+      for (const key of [...wbKeys, ...metaKeys]) {
+        ttlPipeline.expire(key, APP_CONFIG.WHITEBOARD_TTL_AFTER_END);
+      }
+      await ttlPipeline.exec();
+    }
 
     // 8. DB 상태: CLOSING → ARCHIVED
     const closedAt = new Date();
@@ -910,7 +1421,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       where: { id: sessionId },
       data: {
         status: 'ARCHIVED',
-        drawingPath: filePath,
+        drawingPath: s3Key,
         closedAt,
         endError: null,
       },
@@ -925,6 +1436,8 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     roomDrawTick.delete(sessionId);
     tickInitPromise.delete(sessionId);
     pendingStrokes.delete(sessionId);
+    // ✅ #51: 진행 중 투표가 있으면 타이머 취소 + 최종 결과 브로드캐스트 후 정리
+    if (activePolls.has(sessionId)) endPoll(io, sessionId);
 
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
@@ -960,7 +1473,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       sessionId,
       classId: session.classId,
       strokeCount: strokes.length,
-      drawingPath: filePath,
+      drawingPath: s3Key,
     });
 
     return res.json({
@@ -968,7 +1481,7 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       sessionId,
       status: 'ARCHIVED',
       strokeCount: strokes.length,
-      drawingPath: filePath,
+      drawingPath: s3Key,
       closedAt,
     });
   } catch (err) {
@@ -999,9 +1512,9 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       if (!dbSession.drawingPath) {
         return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "DRAWING_NOT_FOUND");
       }
-      const raw = await fs.promises.readFile(dbSession.drawingPath, 'utf8');
+      const raw = await downloadString(dbSession.drawingPath);
       const data = JSON.parse(raw);
-      return res.json({ sessionId, readOnly: true, strokes: data.strokes ?? [] });
+      return res.json({ sessionId, readOnly: true, strokes: (data.strokes ?? []).map(normalizeStroke) });
     }
 
     // ACTIVE: Redis에서 조회
@@ -1020,7 +1533,7 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       } catch (_) {}
     }
 
-    return res.json({ sessionId, readOnly: false, strokes });
+    return res.json({ sessionId, readOnly: false, strokes: strokes.map(normalizeStroke) });
   } catch (err) {
     logger.error("whiteboard get failed", { sessionId, err: err?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "WHITEBOARD_GET_FAILED");
@@ -1116,6 +1629,18 @@ res.json({
 });
 });
 
+
+// ✅ #93: multer 에러 핸들러
+// Express 에러 핸들러는 라우트들 뒤, io.on('connection') 앞에 위치해야 함.
+app.use((err, req, res, next) => {
+  if (err.code === 'FILE_TYPE_INVALID') {
+    return sendHttpError(res, 400, ERRORS.FILE_TYPE_INVALID, 'PDF_ONLY');
+  }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return sendHttpError(res, 400, ERRORS.FILE_TOO_LARGE, 'MAX_50MB');
+  }
+  next(err);
+});
 
 /**
  * ✅ Socket.IO 연결
@@ -1299,8 +1824,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
   });
 
-  // ✅ #44: sync:request (재연결 시 lastTick 기반 delta 또는 full sync)
-  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async ({ lastTick } = {}) => {
+  // ✅ #112: sync:request (페이지 단위, lastTick 기반 delta 또는 full sync)
+  socket.on(SOCKET_EVENTS.SYNC_REQUEST, async ({ materialId, pageNumber, lastTick } = {}) => {
     if (!requireJoined(socket)) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.NOT_JOINED,
@@ -1308,13 +1833,31 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       });
     }
 
-    const roomId = socket.data.roomId;
-    const wbKey = `whiteboard:${roomId}`;
-    const metaKey = `whiteboardMeta:${roomId}`;
+    const normalizedMaterialId =
+      typeof materialId === "string" ? materialId.trim() : "";
+    const normalizedPageNumber = Number(pageNumber);
 
-    // 정수 + 0 이상만 유효 (NaN, 음수, 소수 제외)
+    if (
+      !normalizedMaterialId ||
+      !Number.isInteger(normalizedPageNumber) ||
+      normalizedPageNumber < 1
+    ) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_SYNC_REQUEST",
+      });
+    }
+
+    const roomId = socket.data.roomId;
+    const wbKey = pageWbKey(roomId, normalizedMaterialId, normalizedPageNumber);
+    const metaKey = pageMetaKey(roomId, normalizedMaterialId, normalizedPageNumber);
+
+    const normalizedLastTick =
+      lastTick === undefined || lastTick === null ? null : Number(lastTick);
     const clientLastTick =
-      Number.isInteger(lastTick) && lastTick >= 0 ? lastTick : null;
+      Number.isInteger(normalizedLastTick) && normalizedLastTick >= 0
+        ? normalizedLastTick
+        : null;
 
     try {
       const [rawBoard, rawMeta] = await Promise.all([
@@ -1328,11 +1871,14 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
           const parsed = JSON.parse(rawBoard);
           strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
         } catch (e) {
-          logger.warn("invalid whiteboard json on sync", { roomId, err: e?.message });
+          logger.warn("invalid whiteboard json on sync", {
+            roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber,
+            err: e?.message,
+          });
         }
       }
 
-      // meta 파싱 실패 시 보수적으로 hasDestructiveChange: true
+      // meta 파싱 실패 시 보수적으로 hasDestructiveChange: true → 항상 full sync
       let meta = { serverTick: 0, hasDestructiveChange: true };
       if (rawMeta) {
         try {
@@ -1343,7 +1889,10 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
             updatedAt: parsed?.updatedAt ?? 0,
           };
         } catch (e) {
-          logger.warn("invalid whiteboard meta json on sync", { roomId, err: e?.message });
+          logger.warn("invalid whiteboard meta json on sync", {
+            roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber,
+            err: e?.message,
+          });
         }
       }
 
@@ -1362,14 +1911,15 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         : strokes;
 
       socket.emit(SOCKET_EVENTS.SYNC_STATE, {
-        strokes: payloadStrokes,
+        strokes: payloadStrokes.map(normalizeStroke),
         mode,
         serverTick: meta.serverTick,
+        materialId: normalizedMaterialId,
+        pageNumber: normalizedPageNumber,
       });
 
       logger.info("sync:state sent", {
-        roomId,
-        mode,
+        roomId, materialId: normalizedMaterialId, pageNumber: normalizedPageNumber, mode,
         total: strokes.length,
         delta: payloadStrokes.length,
         clientLastTick,
@@ -1378,7 +1928,12 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         redisMiss: rawBoard === null,
       });
     } catch (err) {
-      logger.error("sync:state failed", { err: err?.message });
+      logger.error("sync:state failed", {
+        roomId,
+        materialId: normalizedMaterialId,
+        pageNumber: normalizedPageNumber,
+        err: err?.message,
+      });
       socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.INTERNAL_ERROR,
         message: "SYNC_FAILED",
@@ -1450,6 +2005,333 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
   logger.error("❌dm publish failed", { err: err?.message });
   socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.DM_PUBLISH_FAILED, message: "DM publish failed" });
 }
+  });
+
+  // ✅ #51: 교사 → 학생 전체 투표 시작
+  socket.on(SOCKET_EVENTS.POLL_START, ({ question, options, duration } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teacher role required" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+
+    if (activePolls.has(sessionId)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_ALREADY_ACTIVE, message: "이미 진행 중인 투표가 있습니다" });
+    }
+
+    if (typeof question !== "string" || !question.trim() || !isValidPollOptions(options)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "INVALID_POLL_PAYLOAD" });
+    }
+
+    // duration 미제공(undefined) → null (타이머 없음)
+    // 제공됐으나 범위 벗어남 → PAYLOAD_INVALID
+    let validDuration = null;
+    if (duration !== undefined) {
+      if (typeof duration !== "number" || duration <= 0 || duration > MAX_POLL_DURATION) {
+        return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "INVALID_POLL_DURATION" });
+      }
+      validDuration = duration;
+    }
+
+    const pollId = randomUUID();
+    const normalizedQuestion = question.trim();
+    const counts = {};
+    options.forEach(o => { counts[o.id] = 0; });
+
+    activePolls.set(sessionId, {
+      pollId,
+      question: normalizedQuestion,
+      options,
+      duration: validDuration,
+      startedAt: Date.now(),
+      startedBy: socket.data.userId,
+      answers: new Map(),
+      counts,
+      timer: validDuration
+        ? setTimeout(() => endPoll(io, sessionId), validDuration * 1000)
+        : null,
+    });
+
+    const { studentsRoom } = getRoleRooms(sessionId);
+    io.to(studentsRoom).emit(SOCKET_EVENTS.POLL_START, {
+      pollId,
+      question: normalizedQuestion,
+      options,
+      duration: validDuration,
+    });
+
+    logger.info("📊 poll started", {
+      sessionId,
+      pollId,
+      teacherUserId: socket.data.userId,
+      duration: validDuration,
+    });
+  });
+
+  // ✅ #51: 학생 응답 수신 → 교사에게 실시간 집계 전송
+  socket.on(SOCKET_EVENTS.POLL_ANSWER, ({ pollId, optionId } = {}) => {
+    if (!requireStudent(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Students only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+    const poll = activePolls.get(sessionId);
+
+    if (!poll || poll.pollId !== pollId) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_NOT_FOUND, message: "활성 투표가 없습니다" });
+    }
+    if (poll.answers.has(socket.data.userId)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_ALREADY_ANSWERED, message: "이미 응답한 투표입니다" });
+    }
+    if (!(optionId in poll.counts)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_INVALID_OPTION, message: "유효하지 않은 선택지입니다" });
+    }
+
+    // 현재 단일 프로세스/단일 인스턴스 기준으로 동시성 문제 가능성 낮음.
+    // 수평 확장(멀티 서버) 시 Redis atomic 연산으로 교체 필요.
+    poll.answers.set(socket.data.userId, optionId);
+    poll.counts[optionId] += 1;
+
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.POLL_RESULT, {
+      pollId,
+      counts: { ...poll.counts },
+      total: poll.answers.size,
+    });
+
+    logger.info("📊 poll answer received", {
+      sessionId,
+      pollId,
+      userId: socket.data.userId,
+      optionId,
+    });
+  });
+
+  // ✅ #51: 교사 조기 종료
+  socket.on(SOCKET_EVENTS.POLL_END, ({ pollId } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teacher role required" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Join a session first" });
+    }
+
+    const sessionId = socket.data.roomId;
+    const poll = activePolls.get(sessionId);
+
+    if (!poll || poll.pollId !== pollId) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.POLL_NOT_FOUND, message: "활성 투표가 없습니다" });
+    }
+
+    endPoll(io, sessionId);
+  });
+
+  // ✅ #54 + #55: 학생 질문 수신 → DB 저장 → 교사에게 전달
+  socket.on(SOCKET_EVENTS.QUESTION_ASK, async ({ content, isAnonymous = false } = {}) => {
+    if (!requireStudent(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Students only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    if (typeof content !== "string") {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
+    }
+
+    const trimmed  = content.trim();
+    // boolean이 아닌 값(예: 문자열 "true")은 false로 간주
+    const anonymous = isAnonymous === true;
+
+    if (!trimmed) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_EMPTY, message: "질문 내용이 비어 있습니다" });
+    }
+    if (trimmed.length > MAX_QUESTION_LENGTH) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_TOO_LONG, message: `최대 ${MAX_QUESTION_LENGTH}자` });
+    }
+
+    const sessionId = socket.data.roomId;
+    const userId    = socket.data.userId;
+
+    // retry 1회 — 일시적 커넥션 실패 완화 목적. FK 제약 위반 등 영구 오류는 해결하지 않음
+    let question;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        question = await prisma.question.create({
+          data: { sessionId, userId, content: trimmed, isAnonymous: anonymous },
+        });
+        break;
+      } catch (err) {
+        if (attempt === 2) {
+          logger.error("question save failed", { sessionId, userId, err });
+          return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_SAVE_FAILED, message: "저장 실패" });
+        }
+      }
+    }
+
+    // ACK: 본인에게만 반환. 마스킹 없이 isAnonymous를 최상위에 포함
+    socket.emit(SOCKET_EVENTS.QUESTION_ACK, {
+      questionId:  question.id,
+      content:     question.content,
+      status:      question.status,
+      isAnonymous: question.isAnonymous,
+      askedAt:     question.createdAt.getTime(),
+    });
+
+    // QUESTION_NEW: 교사에게 broadcast. askedBy 내부에 isAnonymous 포함
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.QUESTION_NEW, {
+      questionId: question.id,
+      content:    question.content,
+      askedBy:    resolveAskedBy(userId, anonymous),
+      status:     question.status,
+      askedAt:    question.createdAt.getTime(),
+    });
+
+    logger.info("❓ question received", { sessionId, userId, questionId: question.id, isAnonymous: anonymous });
+  });
+
+  // ✅ #54 + #56: 질문 목록 조회. 교사=전체, 학생=본인 것만
+  // requireTeacher / requireStudent는 순수 boolean 반환 함수 — emit 없음
+  socket.on(SOCKET_EVENTS.QUESTION_LIST, async () => {
+    const isTeacher = requireTeacher(socket);
+    const isStudent = requireStudent(socket);
+
+    if (!isTeacher && !isStudent) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "권한 없음" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    const sessionId = socket.data.roomId;
+    const userId    = socket.data.userId;
+    const where     = isTeacher ? { sessionId } : { sessionId, userId };
+
+    let questions;
+    try {
+      questions = await prisma.question.findMany({
+        where,
+        orderBy: { createdAt: "asc" },
+        select:  { id: true, userId: true, content: true, status: true,
+                   isAnonymous: true, answer: true, answeredAt: true, createdAt: true },
+      });
+    } catch (err) {
+      logger.error("question list failed", { sessionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_LIST_FAILED, message: "목록 조회 실패" });
+    }
+
+    socket.emit(SOCKET_EVENTS.QUESTION_LIST_RESULT, {
+      questions: questions.map(q => ({
+        questionId:  q.id,
+        content:     q.content,
+        // resolveAskedBy shape: { userId: string|null, isAnonymous: boolean }
+        // 교사: 실제 값 / 학생: null (프론트 팀 확인: nullable 처리됨)
+        askedBy:     isTeacher ? resolveAskedBy(q.userId, q.isAnonymous) : null,
+        status:      q.status,
+        answer:      q.answer ?? null,
+        answeredAt:  q.answeredAt ? q.answeredAt.getTime() : null,
+        askedAt:     q.createdAt.getTime(),
+      })),
+    });
+  });
+
+  // ✅ #56: 교사 답변 등록 → 해당 학생 + 교사 룸에 통지
+  socket.on(SOCKET_EVENTS.QUESTION_ANSWER, async ({ questionId, answer } = {}) => {
+    if (!requireTeacher(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: "Teachers only" });
+    }
+    if (!requireJoined(socket)) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: "Not joined" });
+    }
+
+    if (typeof questionId !== "string" || !questionId.trim()) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "questionId 누락" });
+    }
+    if (typeof answer !== "string" || !answer.trim()) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: "answer 누락" });
+    }
+
+    const trimmedAnswer     = answer.trim();
+    const trimmedQuestionId = questionId.trim();
+
+    if (trimmedAnswer.length > MAX_ANSWER_LENGTH) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: `답변은 최대 ${MAX_ANSWER_LENGTH}자` });
+    }
+
+    const sessionId = socket.data.roomId;
+
+    // 1) findFirst: userId 확보 + 존재/세션 검증 + 상태 사전 확인
+    //    에러 의미를 NOT_FOUND / ALREADY_ANSWERED로 분리하기 위해 먼저 조회
+    let question;
+    try {
+      question = await prisma.question.findFirst({
+        where:  { id: trimmedQuestionId, sessionId },
+        select: { id: true, userId: true, status: true },
+      });
+    } catch (err) {
+      logger.error("question answer fetch failed", { sessionId, questionId: trimmedQuestionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ANSWER_FAILED, message: "답변 처리 실패" });
+    }
+
+    if (!question) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_NOT_FOUND, message: "질문을 찾을 수 없습니다" });
+    }
+    if (question.status === "ANSWERED") {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ALREADY_ANSWERED, message: "이미 답변된 질문입니다" });
+    }
+
+    // 2) updateMany with status: "PENDING" 조건 — 동시성 방어
+    //    findFirst와 updateMany 사이에 다른 요청이 먼저 처리하여
+    //    상태가 PENDING이 아닌 경우 count === 0으로 감지
+    const now = new Date();
+    let updated;
+    try {
+      updated = await prisma.question.updateMany({
+        where: { id: trimmedQuestionId, sessionId, status: "PENDING" },
+        data:  { answer: trimmedAnswer, status: "ANSWERED", answeredAt: now },
+      });
+    } catch (err) {
+      logger.error("question answer update failed", { sessionId, questionId: trimmedQuestionId, err });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ANSWER_FAILED, message: "답변 저장 실패" });
+    }
+
+    if (updated.count === 0) {
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUESTION_ALREADY_ANSWERED, message: "이미 답변된 질문입니다" });
+    }
+
+    // 3) 통지 payload — 이번 범위 최소 구성 (추후 answeredBy 등 확장 가능)
+    const notifyPayload = {
+      questionId:  trimmedQuestionId,
+      answer:      trimmedAnswer,
+      status:      "ANSWERED",
+      answeredAt:  now.getTime(),
+    };
+
+    // 4) 해당 학생에게만 전송 (온라인인 경우)
+    const presence       = getSessionPresence(sessionId);
+    const studentKey     = `student:${question.userId}`;
+    const targetSocketId = presence.get(studentKey);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit(SOCKET_EVENTS.QUESTION_ANSWERED, notifyPayload);
+    }
+    // 오프라인이면 재접속 후 question:list로 복구
+
+    // 5) 교사 룸 전체 broadcast → 교사 화면 즉시 갱신
+    //    요청한 교사 본인도 수신. 프론트는 questionId 기준 idempotent하게 상태 갱신 필요
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.QUESTION_ANSWERED, notifyPayload);
+
+    logger.info("✅ question answered", {
+      sessionId, questionId: trimmedQuestionId,
+      targetUserId: question.userId, online: !!targetSocketId,
+    });
   });
 
   // ✅ chat (보낸 사람 제외)
@@ -1536,21 +2418,33 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   const { e } = payload;
 
   if (e === "ds") {
-    if (typeof payload.sId !== "number" ||
-        typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
-        typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
-        typeof payload.c !== "string" || !payload.c ||
-        typeof payload.w !== "number" || payload.w <= 0) {
+    if (
+      typeof payload.sId !== "number" ||
+      typeof payload.x !== "number" || payload.x < 0 || payload.x > 1 ||
+      typeof payload.y !== "number" || payload.y < 0 || payload.y > 1 ||
+      typeof payload.c !== "string" || !PEN_CONFIG.HEX_RE.test(payload.c) ||
+      typeof payload.w !== "number" || payload.w <= 0 || payload.w > PEN_CONFIG.MAX_WIDTH ||
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DS_PAYLOAD",
       });
     }
     // ✅ #74: ds 데이터를 pendingStrokes에 임시 보관 (de 완성 시 Redis 저장에 사용)
+    // ✅ #111: page → materialId + pageNumber 복합 키로 변경
     const sid = socket.data.roomId;
     if (!pendingStrokes.has(sid)) pendingStrokes.set(sid, new Map());
-    pendingStrokes.get(sid).set(payload.sId, {
-      sId: payload.sId, x: payload.x, y: payload.y, c: payload.c, w: payload.w,
+    const pendingKey = `${payload.sId}:${payload.materialId}:${payload.pageNumber}`;
+    pendingStrokes.get(sid).set(pendingKey, {
+      sId: payload.sId,
+      x: payload.x,
+      y: payload.y,
+      c: payload.c,
+      w: payload.w,
+      materialId: payload.materialId,
+      pageNumber: payload.pageNumber,
     });
   }
 
@@ -1564,7 +2458,11 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   }
 
   if (e === "de") {
-    if (typeof payload.sId !== "number") {
+    if (
+      typeof payload.sId !== "number" ||
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DE_PAYLOAD",
@@ -1596,16 +2494,55 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
   }
 
   // ✅ #44: de → tick 발급 후 브로드캐스트 + Redis 저장 (tick은 emit/store 동일값)
+  // ✅ #111: 페이지 단위 key 사용, dsData 없으면 broadcast만 하고 저장 안 함
   if (e === "de") {
     const sessionId = socket.data.roomId;
-    const wbKey = `whiteboard:${sessionId}`;
-    const metaKey = `whiteboardMeta:${sessionId}`;
+    const { materialId, pageNumber } = payload;
 
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
 
+    const pendingKey = `${payload.sId}:${materialId}:${pageNumber}`;
+    const sessionMap = pendingStrokes.get(sessionId);
+    const dsData = sessionMap?.get(pendingKey);
+
+    if (!dsData) {
+      // ds/de 간 materialId/pageNumber 불일치 여부 탐색 (디버깅용)
+      const mismatch = sessionMap
+        ? [...sessionMap.entries()].find(([, v]) => v.sId === payload.sId)
+        : null;
+
+      logger.warn("draw:append 'de' received without matching 'ds'", {
+        sessionId,
+        sId: payload.sId,
+        materialId,
+        pageNumber,
+        userId: socket.data.userId,
+        ...(mismatch && {
+          storedKey: mismatch[0],
+          storedMaterialId: mismatch[1].materialId,
+          storedPageNumber: mismatch[1].pageNumber,
+        }),
+      });
+
+      socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
+        ...payload,
+        senderUserId: socket.data.userId,
+        senderRole: socket.data.role,
+        t: tick,
+        ts,
+      });
+      return;
+    }
+
+    const wbKey = pageWbKey(sessionId, materialId, pageNumber);
+    const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
+    const lockKey = `${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
+
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_APPEND, {
       ...payload,
+      c: dsData.c,
+      w: dsData.w,
       senderUserId: socket.data.userId,
       senderRole: socket.data.role,
       t: tick,
@@ -1617,30 +2554,26 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       roomId: sessionId,
       e: payload.e,
       sId: payload.sId,
+      materialId,
+      pageNumber,
       t: tick,
     });
 
     try {
-      const dsData = pendingStrokes.get(sessionId)?.get(payload.sId);
-      if (!dsData) {
-        logger.warn("draw:append 'de' received without 'ds'", {
-          sessionId,
-          sId: payload.sId,
-          userId: socket.data.userId,
-        });
-      }
       const newStroke = {
         sId: payload.sId,
-        x: dsData?.x ?? 0,
-        y: dsData?.y ?? 0,
-        c: dsData?.c ?? "#000000",
-        w: dsData?.w ?? 2,
+        x: dsData.x,
+        y: dsData.y,
+        c: dsData.c,
+        w: dsData.w,
         pts: Array.isArray(payload.pts) ? payload.pts : [],
         t: tick,
+        materialId,
+        pageNumber,
       };
 
       // 락 획득 후 GET → parse → upsert → SET (원자적 보장)
-      await withWhiteboardLock(sessionId, async () => {
+      await withWhiteboardLock(lockKey, async () => {
         const [rawBoard, rawMeta] = await Promise.all([
           redis.get(wbKey),
           redis.get(metaKey),
@@ -1676,7 +2609,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         ]);
       });
 
-      pendingStrokes.get(sessionId)?.delete(payload.sId);
+      sessionMap.delete(pendingKey);
     } catch (err) {
       logger.error("whiteboard store update failed", { e, err: err?.message });
     }
@@ -1700,8 +2633,24 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
       });
     }
 
-    // cl: sId 불필요 / un, er: sId 필수
+    // cl/un/er 모두 materialId, pageNumber 필수
     if (!payload || (payload.e !== "cl" && payload.e !== "un" && payload.e !== "er")) {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
+    // 프론트는 cl 이벤트에 항상 scope를 포함하므로 "page"만 허용
+    if (payload.e === "cl" && payload.scope !== "page") {
+      return socket.emit(SOCKET_EVENTS.ERROR, {
+        code: ERRORS.PAYLOAD_INVALID,
+        message: "INVALID_DRAW_CLEAR_PAYLOAD",
+      });
+    }
+    if (
+      typeof payload.materialId !== "string" || !payload.materialId ||
+      !Number.isInteger(payload.pageNumber) || payload.pageNumber < 1
+    ) {
       return socket.emit(SOCKET_EVENTS.ERROR, {
         code: ERRORS.PAYLOAD_INVALID,
         message: "INVALID_DRAW_CLEAR_PAYLOAD",
@@ -1721,15 +2670,19 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     }
 
     const sessionId = socket.data.roomId;
-    const wbKey = `whiteboard:${sessionId}`;
-    const metaKey = `whiteboardMeta:${sessionId}`;
+    const { materialId, pageNumber } = payload;
+    const wbKey = pageWbKey(sessionId, materialId, pageNumber);
+    const metaKey = pageMetaKey(sessionId, materialId, pageNumber);
+    const lockKey = `${sessionId}:${encodeURIComponent(materialId)}:${pageNumber}`;
 
     const tick = await getNextTick(sessionId);
     const ts = Date.now();
 
     socket.to(socket.data.studentsRoom).emit(SOCKET_EVENTS.DRAW_CLEAR, {
       e: payload.e,
-      sId: payload.sId,
+      ...(payload.e !== "cl" && { sId: payload.sId }),
+      materialId,
+      pageNumber,
       senderUserId: socket.data.userId,
       t: tick,
       ts,
@@ -1737,21 +2690,21 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
 
     try {
       // 락 획득 후 GET → parse → filter/clear → SET (원자적 보장)
-      await withWhiteboardLock(sessionId, async () => {
+      await withWhiteboardLock(lockKey, async () => {
         const rawBoard = await redis.get(wbKey);
         let strokes = [];
         if (rawBoard) {
           try {
             const parsed = JSON.parse(rawBoard);
             strokes = Array.isArray(parsed?.strokes) ? parsed.strokes : [];
-          } catch (_) {}
+          } catch (e) {
+            logger.warn("invalid whiteboard json on clear", { sessionId, err: e?.message });
+          }
         }
 
-        if (payload.e === "cl") {
-          strokes = [];
-        } else {
-          strokes = strokes.filter((s) => s.sId !== payload.sId);
-        }
+        strokes = payload.e === "cl"
+          ? []
+          : strokes.filter((s) => s.sId !== payload.sId);
 
         await Promise.all([
           redis.set(wbKey, JSON.stringify({ strokes }), "EX", APP_CONFIG.SESSION_TTL_SECONDS),
@@ -1763,11 +2716,18 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         ]);
       });
 
-      // cl: pending 전체 정리 / un, er: 해당 sId만 정리
+      // cl: 해당 페이지 pending 정리 / un, er: 해당 sId만 정리
       const p = pendingStrokes.get(sessionId);
       if (p) {
-        if (payload.e === "cl") p.clear();
-        else p.delete(payload.sId);
+        if (payload.e === "cl") {
+          // pendingStrokes는 session당 규모가 작다고 가정하고 선형 탐색 사용
+          const suffix = `:${materialId}:${pageNumber}`;
+          for (const key of p.keys()) {
+            if (key.endsWith(suffix)) p.delete(key);
+          }
+        } else {
+          p.delete(`${payload.sId}:${materialId}:${pageNumber}`);
+        }
       }
     } catch (err) {
       logger.error("whiteboard clear failed", { err: err?.message });
@@ -1819,6 +2779,12 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
         pendingStrokes.delete(socket.data.roomId);
         tickInitPromise.delete(socket.data.roomId); // 혹시 남은 init promise 정리
       }
+    }
+
+    // ✅ #45: 교사 disconnect 시 해당 소켓의 미완성 stroke 정리 (메모리 누수 방지)
+    // ds → de 없이 끊기면 pendingStrokes에 고아 항목이 남을 수 있음
+    if (socket.data.role === "teacher" && socket.data.roomId) {
+      pendingStrokes.delete(socket.data.roomId);
     }
   });
 });
