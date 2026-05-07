@@ -31,6 +31,12 @@ const SOCKET_EVENTS = {
   // ✅ #56
   QUESTION_ANSWER:   'question:answer',    // 교사 → 서버 (요청)
   QUESTION_ANSWERED: 'question:answered',  // 서버 → 클라이언트 (통지)
+
+  // ✅ #60
+  QUIZ_ACTIVATE:    'quiz:activate',    // 교사 → 서버: 특정 문항 활성화 요청
+  QUIZ_DEACTIVATE:  'quiz:deactivate',  // 교사 → 서버: 활성 퀴즈 해제 요청
+  QUIZ_ACTIVATED:   'quiz:activated',   // 서버 → 전체: 퀴즈 활성화 알림
+  QUIZ_DEACTIVATED: 'quiz:deactivated', // 서버 → 전체: 퀴즈 비활성화 알림
 };
 
 module.exports = { SOCKET_EVENTS };
