@@ -11,6 +11,7 @@ const { PDFDocument, rgb } = require('pdf-lib');
 
 const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
 const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
+const bcrypt = require('bcryptjs'); // ✅ #124
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -1375,7 +1376,10 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
       create: {
         id: sessionId,
         classId: session.classId,
-        materialId: session.materialId || null,
+        materialId: session.materialId ?? null,
+        title: session.title ?? null,
+        capacity: session.capacity ?? null,
+        passwordHash: session.passwordHash ?? null,
         status: 'CLOSING',
         endAttempts: 1,
       },
@@ -1383,6 +1387,9 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
         status: 'CLOSING',
         endAttempts: { increment: 1 },
         endError: null,
+        title: session.title ?? undefined,
+        capacity: session.capacity ?? undefined,
+        passwordHash: session.passwordHash ?? undefined,
       },
     });
 
@@ -1581,10 +1588,26 @@ app.post('/auth/dev-login', (req, res) => {
 
 
 app.post(ROUTES.SESSION_CREATE, async (req, res) => {
-const { classId, materialId } = req.body;
+const { classId, materialId, title, capacity, password } = req.body;
 
 if (!classId || typeof classId !== "string" || classId.trim() === "") {
   return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "MISSING_CLASS_ID");
+}
+
+// ✅ #124: title 검증
+if (!title || typeof title !== "string" || title.trim() === "") {
+  return sendHttpError(res, 400, ERRORS.SESSION_TITLE_REQUIRED, "SESSION_TITLE_REQUIRED");
+}
+
+// ✅ #124: capacity 검증 (1~200 정수, 200은 단일 수업 규모 상한선)
+const parsedCapacity = Number(capacity);
+if (!Number.isInteger(parsedCapacity) || parsedCapacity < 1 || parsedCapacity > 200) {
+  return sendHttpError(res, 400, ERRORS.SESSION_CAPACITY_INVALID, "SESSION_CAPACITY_INVALID");
+}
+
+// ✅ #124: password 검증
+if (!password || typeof password !== "string" || password.trim() === "") {
+  return sendHttpError(res, 400, ERRORS.SESSION_PASSWORD_REQUIRED, "SESSION_PASSWORD_REQUIRED");
 }
 
 // ✅ classId DB 검증 (RDB 기준으로 유효한 class만 세션 생성 허용)
@@ -1622,12 +1645,17 @@ if (
   }
 }
 
+  // ✅ #124: 앞뒤 공백 제거 후 해시 (입장 시 동일하게 trim 후 비교)
+  const passwordHash = await bcrypt.hash(password.trim(), 10);
   const sessionId = uuidv4();
 
   const sessionData = {
     id: sessionId,
     classId: classId.trim(),
     materialId: normalizedMaterialId,
+    title: title.trim(),
+    capacity: parsedCapacity,
+    passwordHash,
     createdAt: Date.now(),
   };
 
