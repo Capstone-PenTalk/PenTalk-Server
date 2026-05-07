@@ -105,19 +105,34 @@ model Tag {
 }
 
 model Session {
-  id          String        @id @default(cuid())
-  classId     String
-  class       Class         @relation(fields: [classId], references: [id], onDelete: Cascade)
-  materialId  String?
-  material    Material?     @relation(fields: [materialId], references: [id], onDelete: SetNull)
-  status      SessionStatus @default(ACTIVE)
-  drawingPath String?
-  closedAt    DateTime?
-  endAttempts Int           @default(0)
-  endError    String?
-  createdAt   DateTime      @default(now())
+  id            String          @id @default(cuid())
+  classId       String
+  class         Class           @relation(fields: [classId], references: [id], onDelete: Cascade)
+  materialId    String?
+  material      Material?       @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  status        SessionStatus   @default(ACTIVE)
+  drawingPath   String?
+  closedAt      DateTime?
+  endAttempts   Int             @default(0)
+  endError      String?
+  createdAt     DateTime        @default(now())
+  quizQuestions QuizQuestion[]  // ✅ #60
+
   @@index([classId, createdAt])
   @@index([status])
+}
+
+model QuizQuestion {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question  String
+  answer    String
+  order     Int      // 1, 2, 3
+  createdAt DateTime @default(now())
+
+  @@unique([sessionId, order])
+  @@index([sessionId])
 }
 
 model Question {
