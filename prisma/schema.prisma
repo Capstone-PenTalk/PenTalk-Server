@@ -111,6 +111,9 @@ model Session {
   materialId    String?
   material      Material?       @relation(fields: [materialId], references: [id], onDelete: SetNull)
   status        SessionStatus   @default(ACTIVE)
+  title         String?         // #124
+  capacity      Int?            // #124
+  passwordHash  String?         // #124
   drawingPath   String?
   closedAt      DateTime?
   endAttempts   Int             @default(0)
