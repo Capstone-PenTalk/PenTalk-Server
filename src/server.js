@@ -34,6 +34,9 @@ const MAX_MESSAGE_LEN = 300;
 const MAX_POLL_DURATION = 300;     // ✅ #51: 투표 최대 지속 시간 (초)
 const MAX_QUESTION_LENGTH = 500;   // ✅ #54: 질문 최대 길이 (자)
 const MAX_ANSWER_LENGTH   = 1000;  // ✅ #56: 답변 최대 길이 (자)
+const MAX_QUIZ_QUESTIONS       = 3;   // ✅ #60: 세션당 퀴즈 문항 최대 수
+const MAX_QUIZ_QUESTION_LENGTH = 500; // ✅ #60: 문항 최대 길이 (자)
+const MAX_QUIZ_ANSWER_LENGTH   = 300; // ✅ #60: 정답 최대 길이 (자)
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #61: export 제한값
@@ -157,6 +160,10 @@ const archivedSessions = new Set();
 // ※ studentsRoom / teachersRoom은 저장하지 않음.
 //   endPoll은 setTimeout에서 호출될 수 있으므로 getRoleRooms(sessionId)로 직접 계산.
 const activePolls = new Map();
+
+// ✅ #60: 세션별 활성 퀴즈 상태
+// sessionId → { questionId, question, activatedAt, activatedBy }
+const activeQuizzes = new Map();
 
 function userKeyOf(socket) {
   return `${socket.data.role}:${socket.data.userId}`;
@@ -1438,6 +1445,8 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     pendingStrokes.delete(sessionId);
     // ✅ #51: 진행 중 투표가 있으면 타이머 취소 + 최종 결과 브로드캐스트 후 정리
     if (activePolls.has(sessionId)) endPoll(io, sessionId);
+    // ✅ #60: 세션 종료 시 활성 퀴즈 인메모리 정리
+    activeQuizzes.delete(sessionId);
 
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
@@ -1630,6 +1639,206 @@ res.json({
 });
 
 
+// ✅ #60: 퀴즈 문항 관리 REST API
+
+app.get(ROUTES.QUIZ_BASE, requireAuth, requireTeacherRole, async (req, res) => {
+  const { sessionId } = req.params;
+  try {
+    const session = await sessionStore.get(sessionId);
+    if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    const questions = await prisma.quizQuestion.findMany({
+      where: { sessionId },
+      orderBy: { order: 'asc' },
+      select: { id: true, question: true, answer: true, order: true, createdAt: true },
+    });
+
+    const active = activeQuizzes.get(sessionId) ?? null;
+
+    return res.json({
+      ok: true,
+      questions,
+      activeQuestionId: active?.questionId ?? null,
+    });
+  } catch (e) {
+    logger.error('quiz list error', { sessionId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'QUIZ_LIST_FAILED');
+  }
+});
+
+app.post(ROUTES.QUIZ_BASE, requireAuth, requireTeacherRole, async (req, res) => {
+  const { sessionId } = req.params;
+  const { question, answer, order } = req.body ?? {};
+
+  if (typeof question !== 'string' || !question.trim())
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'QUESTION_EMPTY');
+  if (question.trim().length > MAX_QUIZ_QUESTION_LENGTH)
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'QUESTION_TOO_LONG');
+  if (typeof answer !== 'string' || !answer.trim())
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'ANSWER_EMPTY');
+  if (answer.trim().length > MAX_QUIZ_ANSWER_LENGTH)
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'ANSWER_TOO_LONG');
+  if (order !== undefined && (typeof order !== 'number' || ![1, 2, 3].includes(order)))
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'INVALID_ORDER');
+
+  try {
+    const session = await sessionStore.get(sessionId);
+    if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    const existing = await prisma.quizQuestion.findMany({
+      where: { sessionId },
+      select: { order: true },
+    });
+    if (existing.length >= MAX_QUIZ_QUESTIONS)
+      return sendHttpError(res, 409, ERRORS.QUIZ_LIMIT_EXCEEDED, 'QUIZ_LIMIT_EXCEEDED');
+
+    const usedOrders    = new Set(existing.map(q => q.order));
+    const assignedOrder = order ?? [1, 2, 3].find(o => !usedOrders.has(o));
+
+    if (!assignedOrder)
+      return sendHttpError(res, 409, ERRORS.QUIZ_LIMIT_EXCEEDED, 'QUIZ_LIMIT_EXCEEDED');
+
+    let created;
+    try {
+      created = await prisma.quizQuestion.create({
+        data: { sessionId, question: question.trim(), answer: answer.trim(), order: assignedOrder },
+      });
+    } catch (e) {
+      if (e?.code === 'P2002')
+        return sendHttpError(res, 409, ERRORS.QUIZ_ORDER_CONFLICT, 'ORDER_ALREADY_USED');
+      throw e;
+    }
+
+    return res.status(201).json({
+      ok: true,
+      question: {
+        id: created.id,
+        question: created.question,
+        answer: created.answer,
+        order: created.order,
+        createdAt: created.createdAt,
+      },
+    });
+  } catch (e) {
+    logger.error('quiz create error', { sessionId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.QUIZ_SAVE_FAILED, 'QUIZ_SAVE_FAILED');
+  }
+});
+
+app.put(ROUTES.QUIZ_ITEM, requireAuth, requireTeacherRole, async (req, res) => {
+  const { sessionId, questionId } = req.params;
+  const { question, answer } = req.body ?? {};
+
+  if (question === undefined && answer === undefined)
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'NO_UPDATE_FIELDS');
+  if (question !== undefined) {
+    if (typeof question !== 'string' || !question.trim())
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'QUESTION_EMPTY');
+    if (question.trim().length > MAX_QUIZ_QUESTION_LENGTH)
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'QUESTION_TOO_LONG');
+  }
+  if (answer !== undefined) {
+    if (typeof answer !== 'string' || !answer.trim())
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'ANSWER_EMPTY');
+    if (answer.trim().length > MAX_QUIZ_ANSWER_LENGTH)
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'ANSWER_TOO_LONG');
+  }
+
+  try {
+    const session = await sessionStore.get(sessionId);
+    if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    const target = await prisma.quizQuestion.findFirst({
+      where: { id: questionId, sessionId },
+    });
+    if (!target) return sendHttpError(res, 404, ERRORS.QUIZ_NOT_FOUND, 'QUIZ_NOT_FOUND');
+
+    const updateData = {};
+    if (question !== undefined) updateData.question = question.trim();
+    if (answer !== undefined)   updateData.answer   = answer.trim();
+
+    const updated = await prisma.quizQuestion.update({
+      where: { id: questionId },
+      data: updateData,
+    });
+
+    // 활성 중인 문항이 수정됐으면 학생 화면 즉시 갱신
+    const active = activeQuizzes.get(sessionId);
+    if (active?.questionId === questionId) {
+      activeQuizzes.set(sessionId, { ...active, question: updated.question });
+      const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+      io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.QUIZ_ACTIVATED, {
+        questionId: updated.id,
+        question:   updated.question,
+        order:      updated.order,
+        activatedAt: active.activatedAt,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      question: { id: updated.id, question: updated.question, answer: updated.answer, order: updated.order },
+    });
+  } catch (e) {
+    logger.error('quiz update error', { sessionId, questionId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.QUIZ_SAVE_FAILED, 'QUIZ_SAVE_FAILED');
+  }
+});
+
+app.delete(ROUTES.QUIZ_ITEM, requireAuth, requireTeacherRole, async (req, res) => {
+  const { sessionId, questionId } = req.params;
+  try {
+    const session = await sessionStore.get(sessionId);
+    if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId: req.userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    const target = await prisma.quizQuestion.findFirst({
+      where: { id: questionId, sessionId },
+    });
+    if (!target) return sendHttpError(res, 404, ERRORS.QUIZ_NOT_FOUND, 'QUIZ_NOT_FOUND');
+
+    const active = activeQuizzes.get(sessionId);
+    await prisma.quizQuestion.delete({ where: { id: questionId } });
+    if (active?.questionId === questionId) {
+      activeQuizzes.delete(sessionId);
+      const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+      io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.QUIZ_DEACTIVATED, {
+        questionId,
+        deactivatedAt: Date.now(),
+        reason: 'QUESTION_DELETED',
+      });
+    }
+
+    return res.json({ ok: true, questionId });
+  } catch (e) {
+    logger.error('quiz delete error', { sessionId, questionId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'QUIZ_DELETE_FAILED');
+  }
+});
+
 // ✅ #93: multer 에러 핸들러
 // Express 에러 핸들러는 라우트들 뒤, io.on('connection') 앞에 위치해야 함.
 app.use((err, req, res, next) => {
@@ -1770,6 +1979,17 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       classId: session.classId,
       user: { userId: socket.data.userId, role: socket.data.role }
     });
+
+    // ✅ #60: 재접속 시 활성 퀴즈 복원 (answer 미포함)
+    const currentQuiz = activeQuizzes.get(roomId);
+    if (currentQuiz) {
+      socket.emit(SOCKET_EVENTS.QUIZ_ACTIVATED, {
+        questionId:  currentQuiz.questionId,
+        question:    currentQuiz.question,
+        order:       currentQuiz.order,
+        activatedAt: currentQuiz.activatedAt,
+      });
+    }
 
     // ✅ #44: 재연결 시 TTL 갱신 (키 없으면 expire는 무시됨 → allSettled)
     await Promise.allSettled([
@@ -2332,6 +2552,77 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       sessionId, questionId: trimmedQuestionId,
       targetUserId: question.userId, online: !!targetSocketId,
     });
+  });
+
+  // ✅ #60: 퀴즈 소켓 핸들러
+
+  socket.on(SOCKET_EVENTS.QUIZ_ACTIVATE, async ({ questionId } = {}) => {
+    if (!requireTeacher(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: 'Teacher role required' });
+    if (!requireJoined(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: 'Join a session first' });
+    if (typeof questionId !== 'string' || !questionId.trim())
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: 'questionId 누락' });
+
+    const sessionId = socket.data.roomId;
+
+    let target;
+    try {
+      target = await prisma.quizQuestion.findFirst({
+        where: { id: questionId.trim(), sessionId },
+        select: { id: true, question: true, order: true },
+      });
+    } catch (e) {
+      logger.error('quiz activate db error', { sessionId, questionId, err: e?.message });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.INTERNAL_ERROR, message: '조회 실패' });
+    }
+
+    if (!target)
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_NOT_FOUND, message: '문항을 찾을 수 없습니다' });
+
+    const activatedAt = Date.now();
+    activeQuizzes.set(sessionId, {
+      questionId:  target.id,
+      question:    target.question,
+      order:       target.order,
+      activatedAt,
+      activatedBy: socket.data.userId,
+    });
+
+    const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+    io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.QUIZ_ACTIVATED, {
+      questionId:  target.id,
+      question:    target.question,
+      order:       target.order,
+      activatedAt,
+    });
+
+    logger.info('📝 quiz activated', {
+      sessionId, questionId: target.id, order: target.order, teacherUserId: socket.data.userId,
+    });
+  });
+
+  socket.on(SOCKET_EVENTS.QUIZ_DEACTIVATE, () => {
+    if (!requireTeacher(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: 'Teacher role required' });
+    if (!requireJoined(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: 'Join a session first' });
+
+    const sessionId = socket.data.roomId;
+    const active    = activeQuizzes.get(sessionId);
+
+    if (!active)
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_NOT_FOUND, message: '활성 퀴즈가 없습니다' });
+
+    activeQuizzes.delete(sessionId);
+
+    const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+    io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.QUIZ_DEACTIVATED, {
+      questionId:    active.questionId,
+      deactivatedAt: Date.now(),
+    });
+
+    logger.info('📝 quiz deactivated', { sessionId, questionId: active.questionId });
   });
 
   // ✅ chat (보낸 사람 제외)
