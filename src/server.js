@@ -162,8 +162,16 @@ const archivedSessions = new Set();
 const activePolls = new Map();
 
 // ✅ #60: 세션별 활성 퀴즈 상태
-// sessionId → { questionId, question, activatedAt, activatedBy }
+// sessionId → { questionId, question, order, activatedAt, activatedBy }
 const activeQuizzes = new Map();
+
+// ✅ #62: 세션·문항별 답변 집계
+// sessionId → Map<questionId, {
+//   total: Number,
+//   correct: Number,
+//   answers: Map<userId, { submittedAnswer, isCorrect }>
+// }>
+const quizStats = new Map();
 
 function userKeyOf(socket) {
   return `${socket.data.role}:${socket.data.userId}`;
@@ -1447,6 +1455,8 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
     if (activePolls.has(sessionId)) endPoll(io, sessionId);
     // ✅ #60: 세션 종료 시 활성 퀴즈 인메모리 정리
     activeQuizzes.delete(sessionId);
+    // ✅ #62: 세션 종료 시 집계 인메모리 정리
+    quizStats.delete(sessionId);
 
     io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.SESSION_ENDED, {
       sessionId,
@@ -2623,6 +2633,116 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     });
 
     logger.info('📝 quiz deactivated', { sessionId, questionId: active.questionId });
+  });
+
+  // ✅ #62: 퀴즈 답 제출 (학생 전용)
+  socket.on(SOCKET_EVENTS.QUIZ_SUBMIT, async ({ questionId, answer } = {}) => {
+    if (!requireStudent(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.FORBIDDEN, message: 'Students only' });
+    if (!requireJoined(socket))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.NOT_JOINED, message: 'Join a session first' });
+
+    if (typeof questionId !== 'string' || !questionId.trim())
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: 'questionId 누락' });
+
+    const trimmedAnswer = typeof answer === 'string' ? answer.trim() : '';
+    if (!trimmedAnswer)
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: 'answer 누락' });
+    if (trimmedAnswer.length > MAX_QUIZ_ANSWER_LENGTH)
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.PAYLOAD_INVALID, message: `최대 ${MAX_QUIZ_ANSWER_LENGTH}자` });
+
+    const sessionId  = socket.data.roomId;
+    const userId     = socket.data.userId;
+    const trimmedQId = questionId.trim();
+
+    // 활성 퀴즈 확인 — 현재 활성화된 문항만 허용
+    const active = activeQuizzes.get(sessionId);
+    if (!active || active.questionId !== trimmedQId)
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_NOT_ACTIVE, message: '현재 활성화된 퀴즈가 아닙니다' });
+
+    // 인메모리 중복 제출 확인 (빠른 경로)
+    const sessionStats = quizStats.get(sessionId);
+    const qStats       = sessionStats?.get(trimmedQId);
+    if (qStats?.answers.has(userId))
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_ALREADY_SUBMITTED, message: '이미 제출한 문항입니다' });
+
+    // findUnique 대신 findFirst: id(PK) 외에 sessionId 소속 검증을 함께 수행
+    let correctAnswer;
+    try {
+      const q = await prisma.quizQuestion.findFirst({
+        where: { id: trimmedQId, sessionId },
+        select: { answer: true },
+      });
+      if (!q)
+        return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_NOT_FOUND, message: '문항을 찾을 수 없습니다' });
+      correctAnswer = q.answer;
+    } catch (e) {
+      logger.error('quiz submit fetch failed', { sessionId, questionId: trimmedQId, err: e?.message });
+      return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_SUBMIT_FAILED, message: '채점 실패' });
+    }
+
+    const normalizedCorrectAnswer = String(correctAnswer).trim();
+    const isCorrect = trimmedAnswer === normalizedCorrectAnswer;
+
+    // DB 일시 실패 대비 최대 1회 재시도
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await prisma.quizAnswer.create({
+          data: { sessionId, questionId: trimmedQId, userId, submittedAnswer: trimmedAnswer, isCorrect },
+        });
+        break;
+      } catch (e) {
+        if (e?.code === 'P2002') {
+          const existing = await prisma.quizAnswer.findUnique({
+            where: { sessionId_questionId_userId: { sessionId, questionId: trimmedQId, userId } },
+            select: { submittedAnswer: true, isCorrect: true },
+          });
+          if (!existing)
+            return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_SUBMIT_FAILED, message: '기존 제출 조회 실패' });
+          return socket.emit(SOCKET_EVENTS.QUIZ_RESULT, {
+            questionId:      trimmedQId,
+            isCorrect:       existing.isCorrect,
+            submittedAnswer: existing.submittedAnswer,
+            correctAnswer:   normalizedCorrectAnswer,
+          });
+        }
+        if (attempt === 2) {
+          logger.error('quiz submit save failed', { sessionId, questionId: trimmedQId, userId, err: e?.message });
+          return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_SUBMIT_FAILED, message: '저장 실패' });
+        }
+      }
+    }
+
+    // 인메모리 집계 업데이트
+    if (!quizStats.has(sessionId)) quizStats.set(sessionId, new Map());
+    const sStats = quizStats.get(sessionId);
+    if (!sStats.has(trimmedQId)) sStats.set(trimmedQId, { total: 0, correct: 0, answers: new Map() });
+    const stat = sStats.get(trimmedQId);
+    stat.answers.set(userId, { submittedAnswer: trimmedAnswer, isCorrect });
+    stat.total  += 1;
+    if (isCorrect) stat.correct += 1;
+
+    // 학생에게 개인 채점 결과 전송 (본인 소켓에만)
+    socket.emit(SOCKET_EVENTS.QUIZ_RESULT, {
+      questionId:      trimmedQId,
+      isCorrect,
+      submittedAnswer: trimmedAnswer,
+      correctAnswer:   normalizedCorrectAnswer,
+    });
+
+    // 교사에게 집계 현황 전송
+    const { teachersRoom } = getRoleRooms(sessionId);
+    io.to(teachersRoom).emit(SOCKET_EVENTS.QUIZ_STATS, {
+      questionId: trimmedQId,
+      total:      stat.total,
+      correct:    stat.correct,
+      incorrect:  stat.total - stat.correct,
+      rate:       stat.total === 0
+        ? 0
+        : Math.round((stat.correct / stat.total) * 100),
+    });
+
+    logger.info('📝 quiz submitted', { sessionId, questionId: trimmedQId, userId, isCorrect });
   });
 
   // ✅ chat (보낸 사람 제외)
