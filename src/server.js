@@ -1663,15 +1663,13 @@ if (
 
 logger.info("session created", { sessionId, classId: sessionData.classId });
 
-const clientOrigin =
-  process.env.CLIENT_ORIGIN || APP_CONFIG.CORS_ORIGIN || "http://localhost:5173";
+const frontendBaseUrl = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 const ttlSeconds = Number(process.env.SESSION_TTL_SECONDS || 21600);
 
 res.json({
   sessionId,
   materialId: sessionData.materialId,
-  joinUrlTeacher: `${clientOrigin}/?sessionId=${sessionId}&role=teacher`,
-  joinUrlStudent: `${clientOrigin}/?sessionId=${sessionId}&role=student`,
+  joinUrl: `${frontendBaseUrl}/join/${sessionId}`,
   ttlSeconds,
 });
 });
