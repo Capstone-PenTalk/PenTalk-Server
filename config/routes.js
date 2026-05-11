@@ -2,7 +2,8 @@
 
 const ROUTES = {
   SESSION_CREATE: '/session/create',
-  SESSION_END: '/sessions/:sessionId/end',
+  SESSION_JOIN:   '/sessions/:sessionId/join',  // ✅ #126
+  SESSION_END:    '/sessions/:sessionId/end',
   WHITEBOARD_GET: '/sessions/:sessionId/whiteboard',
   MATERIAL_UPLOAD: '/materials/pdf',  // ✅ #93
 

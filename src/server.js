@@ -1675,6 +1675,59 @@ res.json({
 });
 
 
+// ✅ #126: 학생 세션 입장 (비로그인, 비밀번호 검증)
+// Redis에 세션이 존재하는 경우를 ACTIVE로 간주한다.
+// 세션 종료 시 sessionStore.delete()로 Redis에서 삭제하므로
+// Redis 존재 여부 자체가 ACTIVE 상태 검증을 대체한다.
+app.post(ROUTES.SESSION_JOIN, async (req, res) => {
+  const { sessionId } = req.params;
+  const { password } = req.body;
+
+  // 1. 비밀번호 입력값 정규화 및 검증
+  const normalizedPassword = typeof password === "string" ? password.trim() : "";
+  if (!normalizedPassword) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "MISSING_PASSWORD");
+  }
+
+  // 2. 세션 조회 — 없으면 존재하지 않거나 이미 종료된 세션
+  const session = await sessionStore.get(sessionId);
+  if (!session) {
+    return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, "SESSION_NOT_FOUND");
+  }
+
+  // 3. passwordHash 유효성 확인 (데이터 깨짐 또는 구버전 세션 방어)
+  if (typeof session.passwordHash !== "string" || session.passwordHash.trim() === "") {
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "INVALID_SESSION_PASSWORD_HASH");
+  }
+
+  // 4. 비밀번호 검증
+  const isPasswordValid = await bcrypt.compare(normalizedPassword, session.passwordHash);
+  if (!isPasswordValid) {
+    return sendHttpError(res, 401, ERRORS.SESSION_WRONG_PASSWORD, "SESSION_WRONG_PASSWORD");
+  }
+
+  // 5. 제한인원 초과 여부 (학생 룸 현재 접속자 수 기준)
+  const capacity = Number(session.capacity);
+  if (!Number.isFinite(capacity) || capacity <= 0) {
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, "INVALID_SESSION_CAPACITY");
+  }
+
+  const studentsRoom = `session:${sessionId}:students`;
+  const currentCount = io.sockets.adapter.rooms.get(studentsRoom)?.size ?? 0;
+  if (currentCount >= capacity) {
+    return sendHttpError(res, 409, ERRORS.SESSION_CAPACITY_EXCEEDED, "SESSION_CAPACITY_EXCEEDED");
+  }
+
+  // 6. 입장 허가 응답
+  res.json({
+    sessionId,
+    title: session.title,
+    classId: session.classId,
+    materialId: session.materialId ?? null,
+  });
+});
+
+
 // ✅ #60: 퀴즈 문항 관리 REST API
 
 app.get(ROUTES.QUIZ_BASE, requireAuth, requireTeacherRole, async (req, res) => {
