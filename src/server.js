@@ -38,6 +38,7 @@ const MAX_ANSWER_LENGTH   = 1000;  // ✅ #56: 답변 최대 길이 (자)
 const MAX_QUIZ_QUESTIONS       = 3;   // ✅ #60: 세션당 퀴즈 문항 최대 수
 const MAX_QUIZ_QUESTION_LENGTH = 500; // ✅ #60: 문항 최대 길이 (자)
 const MAX_QUIZ_ANSWER_LENGTH   = 300; // ✅ #60: 정답 최대 길이 (자)
+const MAX_QUIZ_DAILY_ATTEMPTS  = 2;   // ✅ #63: 유저 일일 최대 응시 횟수
 const VALID_DRAW_APPEND_TYPES = new Set(["ds", "dm", "de"]);
 
 // ✅ #61: export 제한값
@@ -58,6 +59,20 @@ const PEN_CONFIG = {
 };
 
 // ✅ #45: 구형 stroke 데이터(c/w 없음) 정규화
+// ✅ #63: KST(UTC+9) 기준 날짜 문자열 반환 (yyyyMMdd)
+function getKSTDateString() {
+  const kst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return kst.toISOString().slice(0, 10).replace(/-/g, '');
+}
+
+// ✅ #63: KST 기준 자정까지 남은 초 반환 (Redis TTL용)
+function getSecondsUntilMidnightKST() {
+  const kst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const midnight = new Date(kst);
+  midnight.setUTCHours(24, 0, 0, 0);
+  return Math.ceil((midnight - kst) / 1000);
+}
+
 function normalizeStroke(s) {
   if (!s) return s;
   return {
@@ -2744,6 +2759,28 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     const qStats       = sessionStats?.get(trimmedQId);
     if (qStats?.answers.has(userId))
       return socket.emit(SOCKET_EVENTS.ERROR, { code: ERRORS.QUIZ_ALREADY_SUBMITTED, message: '이미 제출한 문항입니다' });
+
+    // ✅ #63: 일일 응시 횟수 검증 (원자적 INCR)
+    // INCR 선행으로 동시 제출 경쟁 조건 방지 — 공정성 우선
+    // count === 1일 때만 TTL 설정하여 자정 기준 만료가 이후 INCR에서 리셋되지 않도록 함
+    // DB 오류 등 예외로 제출 실패 시 횟수가 1회 소모될 수 있으나, 드문 케이스로 허용
+    const dailyKey = `quiz:count:${userId}:${getKSTDateString()}`;
+    try {
+      const count = await redis.incr(dailyKey);
+      if (count === 1) {
+        await redis.expire(dailyKey, getSecondsUntilMidnightKST());
+      }
+      // 제한 초과 요청도 INCR 값에 포함됨 (응시 성공 횟수가 아닌 제출 시도 횟수 기준)
+      if (count > MAX_QUIZ_DAILY_ATTEMPTS) {
+        return socket.emit(SOCKET_EVENTS.ERROR, {
+          code: ERRORS.QUIZ_DAILY_LIMIT_EXCEEDED,
+          message: `하루 최대 ${MAX_QUIZ_DAILY_ATTEMPTS}회까지 응시할 수 있습니다`,
+        });
+      }
+    } catch (e) {
+      // Redis 장애 시 차단하지 않고 허용 (fail open)
+      logger.warn('quiz daily count check failed, allowing submission', { userId, err: e?.message });
+    }
 
     // findUnique 대신 findFirst: id(PK) 외에 sessionId 소속 검증을 함께 수행
     let correctAnswer;
