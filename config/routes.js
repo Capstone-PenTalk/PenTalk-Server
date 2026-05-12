@@ -3,8 +3,9 @@
 const ROUTES = {
   SESSION_CREATE: '/session/create',
   SESSION_JOIN:   '/sessions/:sessionId/join',  // ✅ #126
-  SESSION_END:    '/sessions/:sessionId/end',
-  WHITEBOARD_GET: '/sessions/:sessionId/whiteboard',
+  SESSION_END:      '/sessions/:sessionId/end',
+  SESSION_MATERIAL: '/sessions/:sessionId/material',  // ✅ #이슈번호: POST(세션 내 자료 업로드)
+  WHITEBOARD_GET:   '/sessions/:sessionId/whiteboard',
   MATERIAL_UPLOAD: '/materials/pdf',  // ✅ #93
 
   // ✅ #60
