@@ -1757,10 +1757,14 @@ app.post(ROUTES.SESSION_JOIN, async (req, res) => {
 
 // ✅ #60: 퀴즈 문항 관리 REST API
 
-app.get(ROUTES.QUIZ_BASE, requireAuth, requireTeacherRole, async (req, res) => {
+app.get(ROUTES.QUIZ_BASE, requireAuth, async (req, res) => {
   const { sessionId } = req.params;
   try {
-    const session = await sessionStore.get(sessionId);
+    // Redis 세션 객체에 status 필드가 없으므로 DB에서 직접 조회
+    const session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      select: { classId: true, status: true },
+    });
     if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
 
     const membership = await prisma.classMember.findFirst({
@@ -1769,18 +1773,29 @@ app.get(ROUTES.QUIZ_BASE, requireAuth, requireTeacherRole, async (req, res) => {
     });
     if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
 
+    if (!['teacher', 'student'].includes(req.role))
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'INVALID_ROLE');
+
+    // 학생은 ARCHIVED 세션만 조회 가능 (수업 중 문항 노출 방지)
+    if (req.role === 'student' && session.status !== 'ARCHIVED')
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'SESSION_NOT_ENDED');
+
+    const isTeacher = req.role === 'teacher';
+
     const questions = await prisma.quizQuestion.findMany({
       where: { sessionId },
       orderBy: { order: 'asc' },
-      select: { id: true, question: true, answer: true, order: true, createdAt: true },
+      select: isTeacher
+        ? { id: true, question: true, answer: true, order: true, createdAt: true }
+        : { id: true, question: true, order: true, createdAt: true },
     });
 
-    const active = activeQuizzes.get(sessionId) ?? null;
+    const active = isTeacher ? (activeQuizzes.get(sessionId) ?? null) : undefined;
 
     return res.json({
       ok: true,
       questions,
-      activeQuestionId: active?.questionId ?? null,
+      ...(isTeacher && { activeQuestionId: active?.questionId ?? null }),
     });
   } catch (e) {
     logger.error('quiz list error', { sessionId, err: e?.message });
@@ -1952,6 +1967,117 @@ app.delete(ROUTES.QUIZ_ITEM, requireAuth, requireTeacherRole, async (req, res) =
   } catch (e) {
     logger.error('quiz delete error', { sessionId, questionId, err: e?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'QUIZ_DELETE_FAILED');
+  }
+});
+
+// ✅ #132: 복습 퀴즈 HTTP 제출 (학생 전용, ARCHIVED 세션)
+app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+  const { questionId, answer } = req.body;
+  const userId = req.userId;
+
+  // 1. 학생 전용
+  if (req.role !== 'student')
+    return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'STUDENTS_ONLY');
+
+  // 2. 입력 검증
+  if (typeof questionId !== 'string' || !questionId.trim())
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'questionId 누락');
+  const trimmedAnswer = typeof answer === 'string' ? answer.trim() : '';
+  if (!trimmedAnswer)
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'answer 누락');
+  if (trimmedAnswer.length > MAX_QUIZ_ANSWER_LENGTH)
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, `최대 ${MAX_QUIZ_ANSWER_LENGTH}자`);
+
+  const trimmedQId = questionId.trim();
+
+  try {
+    // 3. 세션 확인 — ARCHIVED만 허용
+    const dbSession = await prisma.session.findUnique({
+      where: { id: sessionId },
+      select: { classId: true, status: true },
+    });
+    if (!dbSession) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+    if (dbSession.status !== 'ARCHIVED')
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_NOT_ENDED');
+
+    // 4. classMember 검증
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: dbSession.classId, userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    // 5. 일일 응시 횟수 검증 — INCR 선행으로 경쟁 조건 방지 (소켓과 동일 정책)
+    const dailyKey = `quiz:count:${userId}:${getKSTDateString()}`;
+    try {
+      const count = await redis.incr(dailyKey);
+      if (count === 1) await redis.expire(dailyKey, getSecondsUntilMidnightKST());
+      if (count > MAX_QUIZ_DAILY_ATTEMPTS)
+        return sendHttpError(res, 429, ERRORS.QUIZ_DAILY_LIMIT_EXCEEDED, `하루 최대 ${MAX_QUIZ_DAILY_ATTEMPTS}회까지 응시할 수 있습니다`);
+    } catch (e) {
+      logger.warn('quiz daily count check failed, allowing submission', { userId, err: e?.message });
+    }
+
+    // 6. 문항 조회 + 채점
+    let correctAnswer;
+    try {
+      const q = await prisma.quizQuestion.findFirst({
+        where: { id: trimmedQId, sessionId },
+        select: { answer: true },
+      });
+      if (!q) return sendHttpError(res, 404, ERRORS.QUIZ_NOT_FOUND, '문항을 찾을 수 없습니다');
+      correctAnswer = q.answer;
+    } catch (e) {
+      logger.error('quiz submit fetch failed', { sessionId, questionId: trimmedQId, err: e?.message });
+      return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '채점 실패');
+    }
+
+    const normalizedCorrectAnswer = String(correctAnswer).trim();
+    const isCorrect = trimmedAnswer === normalizedCorrectAnswer;
+
+    // 7. DB 저장 — 최대 1회 재시도, P2002 중복키 처리 (소켓과 동일)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await prisma.quizAnswer.create({
+          data: { sessionId, questionId: trimmedQId, userId, submittedAnswer: trimmedAnswer, isCorrect },
+        });
+        break;
+      } catch (e) {
+        if (e?.code === 'P2002') {
+          const existing = await prisma.quizAnswer.findUnique({
+            where: { sessionId_questionId_userId: { sessionId, questionId: trimmedQId, userId } },
+            select: { submittedAnswer: true, isCorrect: true },
+          });
+          if (!existing)
+            return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '기존 제출 조회 실패');
+          return res.json({
+            ok: true,
+            questionId: trimmedQId,
+            isCorrect: existing.isCorrect,
+            submittedAnswer: existing.submittedAnswer,
+            correctAnswer: normalizedCorrectAnswer,
+          });
+        }
+        if (attempt === 2) {
+          logger.error('quiz submit save failed', { sessionId, questionId: trimmedQId, userId, err: e?.message });
+          return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '저장 실패');
+        }
+      }
+    }
+
+    logger.info('📝 quiz http submitted', { sessionId, questionId: trimmedQId, userId, isCorrect });
+
+    return res.json({
+      ok: true,
+      questionId: trimmedQId,
+      isCorrect,
+      submittedAnswer: trimmedAnswer,
+      correctAnswer: normalizedCorrectAnswer,
+    });
+  } catch (e) {
+    logger.error('quiz http submit error', { sessionId, userId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '제출 실패');
   }
 });
 
