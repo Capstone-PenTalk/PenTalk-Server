@@ -12,6 +12,8 @@ const ROUTES = {
   QUIZ_ITEM:   '/sessions/:sessionId/quiz/:questionId',      // PUT(수정), DELETE(삭제)
   // ✅ #132
   QUIZ_SUBMIT: '/sessions/:sessionId/quiz/submit',           // POST(복습 퀴즈 제출, 학생 전용)
+  // ✅ #134
+  QUIZ_RESULT: '/sessions/:sessionId/quiz/result',           // GET(퀴즈 통과 여부 조회)
 };
 
 module.exports = { ROUTES };
