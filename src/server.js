@@ -504,14 +504,26 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // ── 3. 권한 검증: 세션 소속 클래스 멤버인지 확인 ──────────────
-    // 현재 정책: classMember 확인 (teacher/student 구분 없이 동일 엔드포인트)
-    // session-level 참가 이력 검증은 이번 범위 외
     const membership = await prisma.classMember.findFirst({
       where: { classId: session.classId, userId: req.userId },
       select: { id: true },
     });
     if (!membership) {
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
+    }
+
+    // ── 3-1. 퀴즈 통과 검증 (학생만) ─────────────────────────────
+    if (req.role === 'student') {
+      const correctCount = await prisma.quizAnswer.count({
+        where: {
+          sessionId,
+          userId: req.userId,
+          isCorrect: true,
+        },
+      });
+      if (correctCount < 2) {
+        return sendHttpError(res, 403, ERRORS.QUIZ_NOT_PASSED, 'QUIZ_NOT_PASSED');
+      }
     }
 
     // ── 4. 교사 판서 읽기 ─────────────────────────────────────────
