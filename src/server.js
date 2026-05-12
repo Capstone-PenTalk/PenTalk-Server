@@ -2129,6 +2129,86 @@ app.get(ROUTES.QUIZ_RESULT, requireAuth, async (req, res) => {
   }
 });
 
+// ✅ #이슈번호: 세션 내 자료 업로드 및 materialId 연결
+app.post(
+  ROUTES.SESSION_MATERIAL,
+  requireAuth,
+  requireTeacherRole,
+  (req, res, next) => {
+    upload.single('file')(req, res, (err) => {
+      if (err) return next(err);
+      next();
+    });
+  },
+  async (req, res) => {
+    const { sessionId } = req.params;
+
+    if (!req.file)
+      return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'FILE_REQUIRED');
+
+    try {
+      // 1. 세션 확인
+      const session = await prisma.session.findUnique({
+        where: { id: sessionId },
+        select: { classId: true, status: true },
+      });
+      if (!session)
+        return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+      // 2. 교사 소유 클래스 검증
+      const foundClass = await prisma.class.findUnique({
+        where: { id: session.classId },
+        select: { teacherId: true },
+      });
+      if (!foundClass || foundClass.teacherId !== req.userId)
+        return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_TEACHER');
+
+      // 3. ACTIVE 세션만 허용
+      if (session.status !== 'ACTIVE')
+        return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_NOT_ACTIVE');
+
+      // 4. 파일 업로드 (트랜잭션 외부 — S3는 롤백 불가)
+      const { url } = await saveFile(req, req.file);
+
+      // 5. Material 생성 + Session 연결을 트랜잭션으로 묶음
+      const material = await prisma.$transaction(async (tx) => {
+        const mat = await tx.material.create({
+          data: {
+            type: 'pdf',
+            url,
+            name: req.file.originalname,
+            classId: session.classId,
+          },
+          select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
+        });
+
+        // updateMany 조건부 업데이트로 동시 업로드 race condition 방지
+        const updated = await tx.session.updateMany({
+          where: { id: sessionId, materialId: null, status: 'ACTIVE' },
+          data: { materialId: mat.id },
+        });
+
+        // count === 0이면 이미 다른 요청이 먼저 연결한 것 → 트랜잭션 롤백
+        if (updated.count === 0) {
+          const error = new Error('MATERIAL_ALREADY_SET');
+          error.code = 'MATERIAL_ALREADY_SET';
+          throw error;
+        }
+
+        return mat;
+      });
+
+      logger.info('session material uploaded', { sessionId, materialId: material.id });
+      return res.status(201).json({ ok: true, material });
+    } catch (err) {
+      if (err.code === 'MATERIAL_ALREADY_SET')
+        return sendHttpError(res, 409, ERRORS.MATERIAL_ALREADY_SET, 'MATERIAL_ALREADY_SET');
+      logger.error('session material upload failed', { sessionId, err: err?.message });
+      return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
+    }
+  }
+);
+
 // ✅ #93: multer 에러 핸들러
 // Express 에러 핸들러는 라우트들 뒤, io.on('connection') 앞에 위치해야 함.
 app.use((err, req, res, next) => {
