@@ -2081,6 +2081,54 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
   }
 });
 
+// ✅ #134: 퀴즈 통과 여부 조회
+app.get(ROUTES.QUIZ_RESULT, requireAuth, async (req, res) => {
+  const { sessionId } = req.params;
+  const userId = req.userId;
+
+  try {
+    // 1. 세션 확인 (DB 기준)
+    const session = await prisma.session.findUnique({
+      where: { id: sessionId },
+      select: { classId: true, status: true },
+    });
+    if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
+
+    // 2. classMember 검증
+    const membership = await prisma.classMember.findFirst({
+      where: { classId: session.classId, userId },
+      select: { id: true },
+    });
+    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+
+    // 3. role 검증
+    if (!['teacher', 'student'].includes(req.role))
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'INVALID_ROLE');
+
+    // 4. 교사는 항상 통과
+    if (req.role === 'teacher')
+      return res.json({ ok: true, passed: true, correctCount: null });
+
+    // 5. ARCHIVED 이전 상태(ACTIVE·CLOSING·FAILED)에서는 퀴즈 제한 미적용
+    if (session.status !== 'ARCHIVED')
+      return res.json({ ok: true, passed: true, correctCount: null });
+
+    // 6. 정답 개수 조회 및 통과 여부 계산
+    const correctCount = await prisma.quizAnswer.count({
+      where: { sessionId, userId, isCorrect: true },
+    });
+
+    return res.json({
+      ok: true,
+      passed: correctCount >= 2,
+      correctCount,
+    });
+  } catch (e) {
+    logger.error('quiz result error', { sessionId, userId, err: e?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'QUIZ_RESULT_FAILED');
+  }
+});
+
 // ✅ #93: multer 에러 핸들러
 // Express 에러 핸들러는 라우트들 뒤, io.on('connection') 앞에 위치해야 함.
 app.use((err, req, res, next) => {
