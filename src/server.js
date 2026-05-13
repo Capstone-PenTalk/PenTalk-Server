@@ -777,6 +777,78 @@ async function requireClassMember(req, res, next) {
   }
 }
 
+// ✅ #138: 교사용 클래스 생성
+app.post(ROUTES.CLASS_CREATE, requireAuth, requireTeacherRole, async (req, res) => {
+  const { title } = req.body;
+
+  if (!title || typeof title !== 'string' || !title.trim()) {
+    return sendHttpError(res, 400, ERRORS.CLASS_TITLE_REQUIRED, 'CLASS_TITLE_REQUIRED');
+  }
+
+  try {
+    const newClass = await prisma.$transaction(async (tx) => {
+      const created = await tx.class.create({
+        data: {
+          title: title.trim(),
+          teacherId: req.userId,
+        },
+        select: { id: true, title: true, teacherId: true, createdAt: true },
+      });
+
+      await tx.classMember.create({
+        data: {
+          classId: created.id,
+          userId: req.userId,
+          roleInClass: 'teacher',
+        },
+      });
+
+      return created;
+    });
+
+    logger.info('class created', { classId: newClass.id, teacherId: req.userId });
+    return res.status(201).json(newClass);
+  } catch (err) {
+    logger.error('class create failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.CLASS_CREATE_FAILED, 'CLASS_CREATE_FAILED');
+  }
+});
+
+// ✅ #138: 클래스 단건 조회 (멤버만 접근 가능)
+// 응답의 id 필드가 classId 역할을 함. 프론트에서 response.id를 classId로 사용.
+app.get(ROUTES.CLASS_GET, requireAuth, async (req, res) => {
+  const { classId } = req.params;
+
+  try {
+    const foundClass = await prisma.class.findUnique({
+      where: { id: classId },
+      select: { id: true, title: true, teacherId: true, createdAt: true },
+    });
+
+    if (!foundClass) {
+      return sendHttpError(res, 404, ERRORS.CLASS_NOT_FOUND, 'CLASS_NOT_FOUND');
+    }
+
+    const member = await prisma.classMember.findUnique({
+      where: {
+        classId_userId: {
+          classId,
+          userId: req.userId,
+        },
+      },
+    });
+
+    if (!member) {
+      return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'FORBIDDEN');
+    }
+
+    return res.json(foundClass);
+  } catch (err) {
+    logger.error('class get failed', { classId, err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'INTERNAL_ERROR');
+  }
+});
+
 app.post("/subjects", async (req, res) => {
   const { name } = req.body;
 
