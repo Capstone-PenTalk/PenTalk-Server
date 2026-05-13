@@ -2271,6 +2271,15 @@ app.post(
       });
 
       logger.info('session material uploaded', { sessionId, materialId: material.id });
+
+      const updatedSession = await sessionStore.update(sessionId, { materialId: material.id });
+
+      if (updatedSession) {
+        logger.info('redis session materialId synced', { sessionId, materialId: material.id });
+      } else {
+        logger.warn('redis session not found while syncing materialId', { sessionId, materialId: material.id });
+      }
+
       return res.status(201).json({ ok: true, material });
     } catch (err) {
       if (err.code === 'MATERIAL_ALREADY_SET')

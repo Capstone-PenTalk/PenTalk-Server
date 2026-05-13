@@ -35,6 +35,24 @@ module.exports = {
     return result === 1;
   },
 
+  async update(sessionId, patch) {
+    const key = makeKey(sessionId);
+    const current = await this.get(sessionId);
+
+    if (!current) return null;
+
+    const ttl = await redis.ttl(key);
+    const updated = { ...current, ...patch };
+
+    await redis.setex(
+      key,
+      ttl > 0 ? ttl : APP_CONFIG.SESSION_TTL_SECONDS,
+      JSON.stringify(updated)
+    );
+
+    return updated;
+  },
+
   async delete(sessionId) {
     const key = makeKey(sessionId);
     await redis.del(key);
