@@ -1830,12 +1830,32 @@ app.post(ROUTES.SESSION_JOIN, async (req, res) => {
     return sendHttpError(res, 409, ERRORS.SESSION_CAPACITY_EXCEEDED, "SESSION_CAPACITY_EXCEEDED");
   }
 
-  // 6. 입장 허가 응답
+  // 6. material 조회 및 presigned URL 생성
+  let material = null;
+  const sessionMaterialId = session.materialId ?? null;
+  if (sessionMaterialId) {
+    const found = await prisma.material.findUnique({
+      where: { id: sessionMaterialId },
+      select: { id: true, name: true, type: true, url: true },
+    });
+    if (found?.url) {
+      const downloadUrl = await getPresignedUrl(found.url);
+      material = {
+        id: found.id,
+        name: found.name,
+        type: found.type,
+        downloadUrl,
+      };
+    }
+  }
+
+  // 7. 입장 허가 응답
   res.json({
     sessionId,
     title: session.title,
     classId: session.classId,
-    materialId: session.materialId ?? null,
+    materialId: sessionMaterialId,
+    material,
   });
 });
 
