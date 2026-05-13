@@ -1,6 +1,9 @@
 // config/routes.js
 
 const ROUTES = {
+  CLASS_CREATE: '/classes',           // ✅ #138 POST
+  CLASS_GET:    '/classes/:classId',  // ✅ #138 GET
+
   SESSION_CREATE: '/session/create',
   SESSION_JOIN:   '/sessions/:sessionId/join',  // ✅ #126
   SESSION_END:      '/sessions/:sessionId/end',
