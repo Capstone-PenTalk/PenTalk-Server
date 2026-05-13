@@ -2416,12 +2416,12 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       teachersRoom,
     });
 
-    const materialId = session.materialId ?? null;
+    const sessionMaterialId = session.materialId ?? null;
 
     let material = null;
-    if (materialId) {
+    if (sessionMaterialId) {
       material = await prisma.material.findUnique({
-        where: { id: materialId },
+        where: { id: sessionMaterialId },
         select: { id: true, name: true, type: true, url: true },
       });
     }
@@ -2429,7 +2429,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     socket.emit(SOCKET_EVENTS.JOIN_SUCCESS, {
       roomId,
       classId: session.classId,
-      materialId: material?.id ?? materialId,
+      materialId: material?.id ?? sessionMaterialId,
       material,
       user: { userId: socket.data.userId, role: socket.data.role }
     });
