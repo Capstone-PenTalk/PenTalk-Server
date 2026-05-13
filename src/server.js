@@ -1077,6 +1077,8 @@ app.post(
       return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'CLASS_ID_REQUIRED');
     }
 
+    const sessionId = (req.body.sessionId || '').toString().trim() || null;
+
     // classId 검증부터 prisma.create까지 하나의 try로 묶음.
     // findUnique 포함 DB 접근에서 예외가 나도 cleanup이 보장됨.
     try {
@@ -1104,6 +1106,17 @@ app.post(
       });
 
       logger.info('material uploaded', { materialId: material.id, classId });
+
+      if (sessionId) {
+        const updatedSession = await sessionStore.update(sessionId, { materialId: material.id });
+
+        if (updatedSession) {
+          logger.info('redis session materialId synced', { sessionId, materialId: material.id });
+        } else {
+          logger.warn('redis session not found while syncing materialId', { sessionId, materialId: material.id });
+        }
+      }
+
       return res.status(201).json(material);
     } catch (err) {
       logger.error('material upload failed', { err });
