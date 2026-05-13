@@ -2419,6 +2419,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     socket.emit(SOCKET_EVENTS.JOIN_SUCCESS, {
       roomId,
       classId: session.classId,
+      materialId: session.materialId ?? null,
       user: { userId: socket.data.userId, role: socket.data.role }
     });
 
