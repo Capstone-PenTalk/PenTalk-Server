@@ -1884,11 +1884,17 @@ app.get(ROUTES.QUIZ_BASE, requireAuth, async (req, res) => {
     });
     if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
 
-    const membership = await prisma.classMember.findFirst({
-      where: { classId: session.classId, userId: req.userId },
-      select: { id: true },
-    });
-    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+    const skipMemberCheck =
+      process.env.NODE_ENV !== 'production' &&
+      process.env.DEV_SKIP_CLASS_MEMBER_CHECK === 'true';
+
+    if (!skipMemberCheck) {
+      const membership = await prisma.classMember.findFirst({
+        where: { classId: session.classId, userId: req.userId },
+        select: { id: true },
+      });
+      if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+    }
 
     if (!['teacher', 'student'].includes(req.role))
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'INVALID_ROLE');
