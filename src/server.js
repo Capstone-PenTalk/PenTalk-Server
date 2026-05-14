@@ -1771,6 +1771,18 @@ if (
     createdAt: Date.now(),
   };
 
+  await prisma.session.create({
+    data: {
+      id: sessionId,
+      classId: classId.trim(),
+      materialId: normalizedMaterialId,
+      title: title.trim(),
+      capacity: parsedCapacity,
+      passwordHash,
+      status: 'ACTIVE',
+    },
+  });
+
   await sessionStore.create(sessionId, sessionData);
 
 logger.info("session created", { sessionId, classId: sessionData.classId });
