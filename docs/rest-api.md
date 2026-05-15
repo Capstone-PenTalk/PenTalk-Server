@@ -26,6 +26,7 @@ Authorization: Bearer <token>
 
 - [POST /auth/dev-login](#post-authdev-login)
 - [POST /session/create](#post-sessioncreate)
+- [POST /export/pdf](#post-exportpdf)
 - [Subject API](#subject-api)
 - [GET /materials](#get-materials)
 - [Tag API](#tag-api)
@@ -101,6 +102,68 @@ Authorization: Bearer <token>
 | 404 | CLASS_NOT_FOUND | CLASS_NOT_FOUND | 존재하지 않는 class |
 | 404 | MATERIAL_NOT_FOUND | MATERIAL_NOT_FOUND | 존재하지 않는 material |
 | 400 | MATERIAL_CLASS_MISMATCH | MATERIAL_CLASS_MISMATCH | material의 classId 불일치 |
+
+---
+
+## POST /export/pdf
+
+> **인증 필요** — classMember 검증 기반 접근 제어
+
+### 목적
+원본 PDF에 교사 판서와 학생 개인 필기를 합성하여 PDF 파일로 반환한다.
+
+### 접근 검증
+- 요청자가 해당 세션의 클래스 멤버(`classMember`)인지 검증한다.
+- 현재 발표 범위에서는 퀴즈 점수 제한을 적용하지 않는다. (#159)
+
+> **세션 상태에 따른 차단 없음**
+> `ARCHIVED` 상태가 필수 조건이 아니다.
+> 세션 상태는 교사 판서 데이터를 읽는 위치만 결정한다.
+>
+> | 세션 상태 | 교사 판서 데이터 조회 위치 |
+> |-----------|--------------------------|
+> | `ARCHIVED` | S3 파일 (`drawingPath`) |
+> | `ACTIVE` / `CLOSING` | Redis |
+
+> **퀴즈 점수 제한 비활성화 (#159)**
+> 기존에는 학생이 퀴즈 2문제 이상 정답 시에만 export가 허용됐으나,
+> 이번 발표 범위에서 퀴즈 기능을 제외함에 따라 해당 검증이 임시 비활성화됐다.
+
+### Request Body
+```json
+{
+  "sessionId": "SESSION_ID",
+  "strokes": [
+    {
+      "points": [{ "x": 0.1, "y": 0.2, "p": 0.8 }],
+      "color": "#FF0000",
+      "strokeWidth": 3,
+      "pageNumber": 1
+    }
+  ]
+}
+```
+- `sessionId`: 필수.
+- `strokes`: 선택. 학생 개인 필기 stroke 배열. 생략 시 빈 배열로 처리.
+  - 최대 3,000개 stroke, 포인트 합계 최대 30,000개
+  - `pageNumber`: 1 이상 정수. 해당 페이지에 렌더링됨.
+
+### Response 200
+`Content-Type: application/pdf`
+바이너리 PDF 파일 (`attachment; filename="export_{sessionId}.pdf"`)
+
+### Errors
+| HTTP | code | message | 설명 |
+|------|------|---------|------|
+| 400 | PAYLOAD_INVALID | SESSION_ID_REQUIRED | sessionId 누락 |
+| 400 | PAYLOAD_INVALID | STROKES_MUST_BE_ARRAY | strokes가 배열이 아님 |
+| 400 | PAYLOAD_INVALID | TOO_MANY_STROKES | stroke 수 초과 |
+| 400 | PAYLOAD_INVALID | TOO_MANY_POINTS | 포인트 합계 초과 |
+| 400 | MATERIAL_NOT_FOUND | MATERIAL_NOT_FOUND | 세션에 연결된 자료 없음 |
+| 403 | FORBIDDEN | NOT_SESSION_MEMBER | 클래스 멤버 아님 |
+| 404 | SESSION_NOT_FOUND | SESSION_NOT_FOUND | 세션 없음 |
+| 500 | PDF_EXPORT_FAILED | TEACHER_STROKES_UNAVAILABLE | S3 판서 파일 읽기 실패 |
+| 500 | PDF_EXPORT_FAILED | PDF_EXPORT_FAILED | PDF 생성 실패 |
 
 ---
 
