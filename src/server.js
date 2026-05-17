@@ -568,8 +568,10 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // 기존 normalizeStroke 규칙 적용 (c/w/page 누락된 legacy 데이터 보정)
+    // pts → points 변환: Redis 저장 형식(pts)과 렌더링 필드(points) 통일
     teacherStrokes = teacherStrokes
       .map(normalizeStroke)
+      .map(s => s && !s.points && Array.isArray(s.pts) ? { ...s, points: s.pts } : s)
       .filter(s => s && Array.isArray(s.points) && s.points.length > 1);
 
     // tick 오름차순 정렬 (t 없는 legacy stroke는 0 취급 → 앞쪽 배치)
