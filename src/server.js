@@ -568,7 +568,9 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // 기존 normalizeStroke 규칙 적용 (c/w/page 누락된 legacy 데이터 보정)
-    teacherStrokes = teacherStrokes.map(normalizeStroke);
+    teacherStrokes = teacherStrokes
+      .map(normalizeStroke)
+      .filter(s => s && Array.isArray(s.points) && s.points.length > 1);
 
     // tick 오름차순 정렬 (t 없는 legacy stroke는 0 취급 → 앞쪽 배치)
     // t가 없는 데이터는 정확한 순서를 알 수 없으므로 유효 tick stroke 앞에 배치
