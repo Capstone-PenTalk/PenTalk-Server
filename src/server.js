@@ -503,12 +503,9 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
       return sendHttpError(res, 400, ERRORS.MATERIAL_NOT_FOUND, 'MATERIAL_NOT_FOUND');
     }
 
-    // ── 3. 권한 검증: 세션 소속 클래스 멤버인지 확인 ──────────────
-    const membership = await prisma.classMember.findFirst({
-      where: { classId: session.classId, userId: req.userId },
-      select: { id: true },
-    });
-    if (!membership) {
+    // ── 3. 권한 검증: 소켓으로 세션에 입장한 적 있는지 확인 ──────────
+    const isMember = await redis.sismember(`session:${sessionId}:participants`, req.userId);
+    if (!isMember) {
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
     }
 
@@ -2476,6 +2473,9 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     socket.data.studentsRoom = studentsRoom;
     socket.data.teachersRoom = teachersRoom;
     socket.data.roleRoom = roleRoom;
+
+    await redis.sadd(`session:${roomId}:participants`, socket.data.userId);
+    await redis.expire(`session:${roomId}:participants`, APP_CONFIG.USER_SESSION_CACHE_TTL);
 
     logger.info("✅join room success", {
       socketId: socket.id,
