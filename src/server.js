@@ -2804,8 +2804,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
         : null,
     });
 
-    const { studentsRoom } = getRoleRooms(sessionId);
-    io.to(studentsRoom).emit(SOCKET_EVENTS.POLL_START, {
+    const { studentsRoom, teachersRoom } = getRoleRooms(sessionId);
+    io.to(studentsRoom).to(teachersRoom).emit(SOCKET_EVENTS.POLL_START, {
       pollId,
       question: normalizedQuestion,
       options,
