@@ -510,21 +510,19 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // ── 3-1. 퀴즈 통과 검증 (학생만) ─────────────────────────────
-    // TODO(#159): 발표 범위에서 퀴즈 기능 제외 → 퀴즈 점수 기반 PDF export 제한 임시 비활성화
-    // 추후 퀴즈 기능 재도입 시 아래 로직 주석 해제
-    // if (req.role === 'student') {
-    //   const correctCount = await prisma.quizAnswer.count({
-    //     where: {
-    //       sessionId,
-    //       userId: req.userId,
-    //       isCorrect: true,
-    //     },
-    //   });
-    //
-    //   if (correctCount < 2) {
-    //     return sendHttpError(res, 403, ERRORS.QUIZ_NOT_PASSED, 'QUIZ_NOT_PASSED');
-    //   }
-    // }
+    if (req.role === 'student') {
+      const correctCount = await prisma.quizAnswer.count({
+        where: {
+          sessionId,
+          userId: req.userId,
+          isCorrect: true,
+        },
+      });
+
+      if (correctCount < 2) {
+        return sendHttpError(res, 403, ERRORS.QUIZ_NOT_PASSED, 'QUIZ_NOT_PASSED');
+      }
+    }
 
     // ── 4. 교사 판서 읽기 ─────────────────────────────────────────
     let teacherStrokes = [];
