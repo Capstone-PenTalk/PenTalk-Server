@@ -1855,6 +1855,48 @@ app.post(ROUTES.AUTH_SIGNUP, async (req, res) => {
   }
 });
 
+// ✅ #173: 로그인
+// POST /auth/login
+// Body: { loginId, password }
+app.post(ROUTES.AUTH_LOGIN, async (req, res) => {
+  const { loginId, password } = req.body;
+
+  if (!loginId || typeof loginId !== 'string' || !loginId.trim()) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'LOGIN_ID_REQUIRED');
+  }
+  if (!password || typeof password !== 'string' || !password.trim()) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'PASSWORD_REQUIRED');
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { loginId: loginId.trim() },
+      select: { id: true, loginId: true, name: true, role: true, passwordHash: true, createdAt: true },
+    });
+
+    // 아이디 없음 / 비밀번호 불일치 모두 동일 에러 (사용자 열거 방지)
+    if (!user || !user.passwordHash) {
+      return sendHttpError(res, 401, ERRORS.LOGIN_FAILED, 'LOGIN_FAILED');
+    }
+
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
+    if (!isMatch) {
+      return sendHttpError(res, 401, ERRORS.LOGIN_FAILED, 'LOGIN_FAILED');
+    }
+
+    const token = signToken({ userId: user.id, role: user.role });
+
+    logger.info('user logged in', { userId: user.id, role: user.role });
+    return res.json({
+      token,
+      user: { id: user.id, loginId: user.loginId, name: user.name, role: user.role, createdAt: user.createdAt },
+    });
+  } catch (err) {
+    logger.error('login failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'INTERNAL_ERROR');
+  }
+});
+
 
 app.post(ROUTES.SESSION_CREATE, async (req, res) => {
 const { classId, materialId, title, capacity, password } = req.body;
