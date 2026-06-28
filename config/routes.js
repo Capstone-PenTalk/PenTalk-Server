@@ -3,6 +3,7 @@
 const ROUTES = {
   AUTH_SIGNUP:   '/auth/signup',    // ✅ #172 POST
   AUTH_CHECK_ID: '/auth/check-id',  // ✅ #172 GET
+  AUTH_LOGIN:    '/auth/login',     // ✅ #173 POST
 
   CLASS_CREATE: '/classes',           // ✅ #138 POST
   CLASS_GET:    '/classes/:classId',  // ✅ #138 GET
