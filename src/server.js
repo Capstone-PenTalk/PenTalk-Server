@@ -7,7 +7,9 @@ const { ERRORS } = require("../config/errors");
 const { sendHttpError } = require("./utils/httpError");
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
-const { PDFDocument, rgb } = require('pdf-lib');
+const { PDFDocument, rgb, degrees } = require('pdf-lib');
+const fontkit = require('@pdf-lib/fontkit');
+const fs = require('fs');
 
 const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
 const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
@@ -108,6 +110,50 @@ async function scanPageKeys(sessionId) {
     }
   } while (cursor !== '0');
   return keys;
+}
+
+// ✅ #66: 폰트 파일 사전 로드 (서버 시작 시 1회)
+const NOTO_SANS_KR_BYTES = fs.readFileSync(
+  path.join(__dirname, 'assets', 'NotoSansKR-Regular.otf')
+);
+
+// ✅ #66: 페이지에 워터마크 삽입 (날짜 + 이름, 사선 5회 반복)
+async function applyWatermark(pdfDoc, userName) {
+  pdfDoc.registerFontkit(fontkit);
+  const font = await pdfDoc.embedFont(NOTO_SANS_KR_BYTES);
+
+  const dateStr = new Intl.DateTimeFormat('ko-KR', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date()).replace(/\./g, '').replace(/\s/g, '');
+  const text = `${dateStr}  ${userName}`;
+  const fontSize = 18;
+  const opacity = 0.15;
+
+  const pages = pdfDoc.getPages();
+  for (const page of pages) {
+    const { width, height } = page.getSize();
+    const textWidth = font.widthOfTextAtSize(text, fontSize);
+    const cols = 2;
+    const rows = 3;
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x = (width / cols) * col + width / (cols * 2) - textWidth / 2;
+        const y = (height / rows) * row + height / (rows * 2);
+        page.drawText(text, {
+          x,
+          y,
+          size: fontSize,
+          font,
+          color: rgb(0.5, 0.5, 0.5),
+          opacity,
+          rotate: degrees(30),
+        });
+      }
+    }
+  }
 }
 
 // ✅ #61: hex 색상 → pdf-lib rgb 변환 (#RGB, #RRGGBB 모두 지원)
@@ -491,11 +537,17 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
       return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'TOO_MANY_POINTS');
     }
 
-    // ── 2. 세션 + material 조회 ───────────────────────────────────
-    const session = await prisma.session.findUnique({
-      where: { id: sessionId },
-      include: { material: { select: { url: true } } },
-    });
+    // ── 2. 세션 + material 조회 / 유저 이름 조회 ─────────────────
+    const [session, exporter] = await Promise.all([
+      prisma.session.findUnique({
+        where: { id: sessionId },
+        include: { material: { select: { url: true } } },
+      }),
+      prisma.user.findUnique({
+        where: { id: req.userId },
+        select: { name: true },
+      }),
+    ]);
     if (!session) {
       return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
     }
@@ -692,7 +744,11 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
       }
     }
 
-    // ── 10. PDF 반환 ──────────────────────────────────────────────
+    // ── 10. 워터마크 삽입 ─────────────────────────────────────────
+    const userName = exporter?.name || req.userId || 'unknown';
+    await applyWatermark(pdfDoc, userName);
+
+    // ── 11. PDF 반환 ──────────────────────────────────────────────
     const pdfBytes = await pdfDoc.save();
     const buf = Buffer.from(pdfBytes);
 
