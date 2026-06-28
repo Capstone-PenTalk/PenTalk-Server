@@ -1764,6 +1764,97 @@ app.post('/auth/dev-login', (req, res) => {
 
 });
 
+// ✅ #172: 아이디 중복 확인
+// GET /auth/check-id?loginId=xxx
+app.get(ROUTES.AUTH_CHECK_ID, async (req, res) => {
+  const loginId = (req.query.loginId || '').toString().trim();
+
+  if (!loginId || loginId.length < 4 || loginId.length > 20 || !/^[a-zA-Z0-9_]+$/.test(loginId)) {
+    return sendHttpError(res, 400, ERRORS.INVALID_LOGIN_ID, 'INVALID_LOGIN_ID');
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({
+      where: { loginId },
+      select: { id: true },
+    });
+    return res.json({ available: !existing });
+  } catch (err) {
+    logger.error('check-id failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'INTERNAL_ERROR');
+  }
+});
+
+// ✅ #172: 회원가입
+// POST /auth/signup
+// Body: { loginId, password, name, role }
+app.post(ROUTES.AUTH_SIGNUP, async (req, res) => {
+  const { loginId, password, name, role } = req.body;
+
+  // loginId: 영문·숫자·언더스코어, 4~20자
+  if (
+    !loginId ||
+    typeof loginId !== 'string' ||
+    !/^[a-zA-Z0-9_]{4,20}$/.test(loginId.trim())
+  ) {
+    return sendHttpError(res, 400, ERRORS.INVALID_LOGIN_ID, 'INVALID_LOGIN_ID');
+  }
+
+  // password: 8~30자, 영문+숫자 각 1자 이상 포함
+  if (
+    !password ||
+    typeof password !== 'string' ||
+    password.length < 8 ||
+    password.length > 30 ||
+    !/[a-zA-Z]/.test(password) ||
+    !/[0-9]/.test(password)
+  ) {
+    return sendHttpError(res, 400, ERRORS.INVALID_PASSWORD, 'INVALID_PASSWORD');
+  }
+
+  // name: 1~20자
+  if (!name || typeof name !== 'string' || !name.trim() || name.trim().length > 20) {
+    return sendHttpError(res, 400, ERRORS.INVALID_NAME, 'INVALID_NAME');
+  }
+
+  if (!role || !['teacher', 'student'].includes(role)) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'INVALID_ROLE');
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({
+      where: { loginId: loginId.trim() },
+      select: { id: true },
+    });
+    if (existing) {
+      return sendHttpError(res, 409, ERRORS.LOGIN_ID_TAKEN, 'LOGIN_ID_TAKEN');
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: {
+        loginId: loginId.trim(),
+        passwordHash,
+        name: name.trim(),
+        role,
+      },
+      select: { id: true, loginId: true, name: true, role: true, createdAt: true },
+    });
+
+    const token = signToken({ userId: user.id, role: user.role });
+
+    logger.info('user signed up', { userId: user.id, role: user.role });
+    return res.status(201).json({ token, user });
+  } catch (err) {
+    if (err?.code === 'P2002') {
+      return sendHttpError(res, 409, ERRORS.LOGIN_ID_TAKEN, 'LOGIN_ID_TAKEN');
+    }
+    logger.error('signup failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.USER_CREATE_FAILED, 'USER_CREATE_FAILED');
+  }
+});
+
 
 app.post(ROUTES.SESSION_CREATE, async (req, res) => {
 const { classId, materialId, title, capacity, password } = req.body;

@@ -1,6 +1,9 @@
 // config/routes.js
 
 const ROUTES = {
+  AUTH_SIGNUP:   '/auth/signup',    // ✅ #172 POST
+  AUTH_CHECK_ID: '/auth/check-id',  // ✅ #172 GET
+
   CLASS_CREATE: '/classes',           // ✅ #138 POST
   CLASS_GET:    '/classes/:classId',  // ✅ #138 GET
 
