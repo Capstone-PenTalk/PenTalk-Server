@@ -556,8 +556,8 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // ── 3. 권한 검증: 소켓으로 세션에 입장한 적 있는지 확인 ──────────
-    const isMember = await redis.sismember(`session:${sessionId}:participants`, req.userId);
-    if (!isMember) {
+    const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(req.userId));
+    if (!isParticipant) {
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
     }
 
@@ -2083,17 +2083,8 @@ app.get(ROUTES.QUIZ_BASE, requireAuth, async (req, res) => {
     });
     if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
 
-    const skipMemberCheck =
-      process.env.NODE_ENV !== 'production' &&
-      process.env.DEV_SKIP_CLASS_MEMBER_CHECK === 'true';
-
-    if (!skipMemberCheck) {
-      const membership = await prisma.classMember.findFirst({
-        where: { classId: session.classId, userId: req.userId },
-        select: { id: true },
-      });
-      if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
-    }
+    const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(req.userId));
+    if (!isParticipant) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
 
     if (!['teacher', 'student'].includes(req.role))
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'INVALID_ROLE');
@@ -2665,7 +2656,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     socket.data.teachersRoom = teachersRoom;
     socket.data.roleRoom = roleRoom;
 
-    await redis.sadd(`session:${roomId}:participants`, socket.data.userId);
+    await redis.sadd(`session:${roomId}:participants`, String(socket.data.userId));
     await redis.expire(`session:${roomId}:participants`, APP_CONFIG.USER_SESSION_CACHE_TTL);
 
     logger.info("✅join room success", {
