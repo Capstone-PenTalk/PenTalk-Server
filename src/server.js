@@ -2284,9 +2284,12 @@ app.delete(ROUTES.QUIZ_ITEM, requireAuth, requireTeacherRole, async (req, res) =
 });
 
 // ✅ #132: 복습 퀴즈 HTTP 제출 (학생 전용, ARCHIVED 세션)
+// ✅ #185: isRetryStart — 프론트가 "다시 응시하기"로 3문제 세트를 새로 시작할 때만 true로 보내는 플래그.
+//   첫 응시(당일 최초 응시)의 문항 제출에는 포함하지 않으며, 재응시 세트의 "첫 번째" 문항 제출에만 true.
+//   같은 세트 내 두 번째/세 번째 문항 제출에는 보내지 않음(또는 false) — 서버는 이 시점에만 일일 재응시 횟수를 증가시킴.
 app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
   const { sessionId } = req.params;
-  const { questionId, answer } = req.body;
+  const { questionId, answer, isRetryStart } = req.body;
   const userId = req.userId;
 
   // 1. 학생 전용
@@ -2301,6 +2304,8 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
     return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'answer 누락');
   if (trimmedAnswer.length > MAX_QUIZ_ANSWER_LENGTH)
     return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, `최대 ${MAX_QUIZ_ANSWER_LENGTH}자`);
+  if (isRetryStart !== undefined && typeof isRetryStart !== 'boolean')
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'isRetryStart 형식 오류');
 
   const trimmedQId = questionId.trim();
 
@@ -2321,18 +2326,8 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
     });
     if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
 
-    // 5. 일일 응시 횟수 검증 — INCR 선행으로 경쟁 조건 방지 (소켓과 동일 정책)
-    const dailyKey = `quiz:count:${userId}:${getKSTDateString()}`;
-    try {
-      const count = await redis.incr(dailyKey);
-      if (count === 1) await redis.expire(dailyKey, getSecondsUntilMidnightKST());
-      if (count > MAX_QUIZ_DAILY_ATTEMPTS)
-        return sendHttpError(res, 429, ERRORS.QUIZ_DAILY_LIMIT_EXCEEDED, `하루 최대 ${MAX_QUIZ_DAILY_ATTEMPTS}회까지 응시할 수 있습니다`);
-    } catch (e) {
-      logger.warn('quiz daily count check failed, allowing submission', { userId, err: e?.message });
-    }
-
-    // 6. 문항 조회 + 채점
+    // 5. 문항 조회 + 채점 — 재응시 횟수 검증보다 먼저 수행해서, 잘못된 questionId로는
+    //    재응시 횟수가 소모되지 않도록 함
     let correctAnswer;
     try {
       const q = await prisma.quizQuestion.findFirst({
@@ -2348,6 +2343,19 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
 
     const normalizedCorrectAnswer = String(correctAnswer).trim();
     const isCorrect = trimmedAnswer === normalizedCorrectAnswer;
+
+    // 6. 재응시 세트 시작 시점에만 일일 재응시 횟수 검증 — 첫 응시는 카운트하지 않음
+    if (isRetryStart === true) {
+      const dailyKey = `quiz:count:${userId}:${getKSTDateString()}`;
+      try {
+        const count = await redis.incr(dailyKey);
+        if (count === 1) await redis.expire(dailyKey, getSecondsUntilMidnightKST());
+        if (count > MAX_QUIZ_DAILY_ATTEMPTS)
+          return sendHttpError(res, 429, ERRORS.QUIZ_DAILY_LIMIT_EXCEEDED, `하루 최대 ${MAX_QUIZ_DAILY_ATTEMPTS}회까지 재응시할 수 있습니다`);
+      } catch (e) {
+        logger.warn('quiz daily count check failed, allowing submission', { userId, err: e?.message });
+      }
+    }
 
     // 7. DB 저장 — 재응시 시 최신 답안으로 재채점되도록 upsert 사용
     try {
