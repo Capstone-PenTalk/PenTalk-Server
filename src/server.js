@@ -2349,34 +2349,16 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
     const normalizedCorrectAnswer = String(correctAnswer).trim();
     const isCorrect = trimmedAnswer === normalizedCorrectAnswer;
 
-    // 7. DB 저장 — 최대 1회 재시도, P2002 중복키 처리 (소켓과 동일)
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await prisma.quizAnswer.create({
-          data: { sessionId, questionId: trimmedQId, userId, submittedAnswer: trimmedAnswer, isCorrect },
-        });
-        break;
-      } catch (e) {
-        if (e?.code === 'P2002') {
-          const existing = await prisma.quizAnswer.findUnique({
-            where: { sessionId_questionId_userId: { sessionId, questionId: trimmedQId, userId } },
-            select: { submittedAnswer: true, isCorrect: true },
-          });
-          if (!existing)
-            return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '기존 제출 조회 실패');
-          return res.json({
-            ok: true,
-            questionId: trimmedQId,
-            isCorrect: existing.isCorrect,
-            submittedAnswer: existing.submittedAnswer,
-            correctAnswer: normalizedCorrectAnswer,
-          });
-        }
-        if (attempt === 2) {
-          logger.error('quiz submit save failed', { sessionId, questionId: trimmedQId, userId, err: e?.message });
-          return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '저장 실패');
-        }
-      }
+    // 7. DB 저장 — 재응시 시 최신 답안으로 재채점되도록 upsert 사용
+    try {
+      await prisma.quizAnswer.upsert({
+        where: { sessionId_questionId_userId: { sessionId, questionId: trimmedQId, userId } },
+        create: { sessionId, questionId: trimmedQId, userId, submittedAnswer: trimmedAnswer, isCorrect },
+        update: { submittedAnswer: trimmedAnswer, isCorrect },
+      });
+    } catch (e) {
+      logger.error('quiz submit save failed', { sessionId, questionId: trimmedQId, userId, err: e?.message });
+      return sendHttpError(res, 500, ERRORS.QUIZ_SUBMIT_FAILED, '저장 실패');
     }
 
     logger.info('📝 quiz http submitted', { sessionId, questionId: trimmedQId, userId, isCorrect });
