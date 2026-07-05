@@ -5,6 +5,14 @@ const ROUTES = {
   AUTH_CHECK_ID: '/auth/check-id',  // ✅ #172 GET
   AUTH_LOGIN:    '/auth/login',     // ✅ #173 POST
 
+  // ✅ 소셜 로그인(구글/카카오)
+  AUTH_GOOGLE:          '/auth/google',          // GET: 인증 시작 (Provider로 리다이렉트)
+  AUTH_GOOGLE_CALLBACK: '/auth/google/callback',  // GET: Provider redirect_uri
+  AUTH_KAKAO:           '/auth/kakao',            // GET: 인증 시작
+  AUTH_KAKAO_CALLBACK:  '/auth/kakao/callback',    // GET: Provider redirect_uri
+  AUTH_EXCHANGE:        '/auth/exchange',          // POST: 1회용 코드 → JWT 교환
+  AUTH_ROLE:            '/auth/role',              // PATCH: 최초 역할 확정
+
   CLASS_CREATE: '/classes',           // ✅ #138 POST
   CLASS_GET:    '/classes/:classId',  // ✅ #138 GET
 

@@ -23,11 +23,16 @@ model User {
   id           String        @id @default(cuid())
   loginId      String?       @unique
   passwordHash String?
+  provider     String        @default("local") // "local" | "google" | "kakao"
+  providerId   String?
+  email        String?       @unique
   name         String?
-  role         String
+  role         String?       // 소셜 로그인 최초 가입 시 역할 선택 전에는 null
   createdAt    DateTime      @default(now())
   classes      Class[]       @relation("TeacherClasses")
   ClassMember  ClassMember[]
+
+  @@unique([provider, providerId])
 }
 
 model Class {

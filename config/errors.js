@@ -84,6 +84,15 @@ const ERRORS = {
 
   // ✅ #173: 로그인
   LOGIN_FAILED: "LOGIN_FAILED",
+
+  // ✅ 소셜 로그인(구글/카카오)
+  ROLE_REQUIRED:            "ROLE_REQUIRED",
+  ROLE_ALREADY_SET:         "ROLE_ALREADY_SET",
+  ACCESS_DENIED:            "ACCESS_DENIED",
+  PROVIDER_ERROR:           "PROVIDER_ERROR",
+  INVALID_STATE:            "INVALID_STATE",
+  EMAIL_ALREADY_REGISTERED: "EMAIL_ALREADY_REGISTERED",
+  EXCHANGE_FAILED:          "EXCHANGE_FAILED",
 };
 
 module.exports = { ERRORS };
