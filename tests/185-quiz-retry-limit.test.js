@@ -19,19 +19,16 @@ const redis = require('../src/lib/redis');
 const PORT = 3103;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const SESSION_ID = `test-session-185-${Date.now()}`;
-const CLASS_ID = 'test-class-185';
 const VALID_QUESTION_IDS = ['q1', 'q2', 'q3'];
 const INVALID_QUESTION_ID = 'bad-question-id';
 
 const mockSessionFindUnique = jest.fn();
-const mockClassMemberFindFirst = jest.fn();
 const mockQuizQuestionFindFirst = jest.fn();
 const mockQuizAnswerUpsert = jest.fn();
 
 jest.mock('@prisma/client', () => ({
   PrismaClient: jest.fn().mockImplementation(() => ({
     session: { findUnique: mockSessionFindUnique },
-    classMember: { findFirst: mockClassMemberFindFirst },
     quizQuestion: { findFirst: mockQuizQuestionFindFirst },
     quizAnswer: { upsert: mockQuizAnswerUpsert },
   })),
@@ -92,6 +89,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await redis.del(`session:${SESSION_ID}:participants`);
   ioInstance.close();
   await new Promise((resolve) => serverInstance.close(resolve));
 }, 20000);
@@ -99,8 +97,7 @@ afterAll(async () => {
 beforeEach(() => {
   jest.clearAllMocks();
 
-  mockSessionFindUnique.mockResolvedValue({ classId: CLASS_ID, status: 'ARCHIVED' });
-  mockClassMemberFindFirst.mockResolvedValue({ id: 'membership-1' });
+  mockSessionFindUnique.mockResolvedValue({ status: 'ARCHIVED' });
   mockQuizQuestionFindFirst.mockImplementation(({ where }) =>
     VALID_QUESTION_IDS.includes(where.id) ? Promise.resolve({ answer: 'O' }) : Promise.resolve(null),
   );
@@ -110,6 +107,7 @@ beforeEach(() => {
 test('1. isRetryStart 없이 첫 응시 3문항을 제출해도 daily count가 증가하지 않는다', async () => {
   const userId = `student-185-1-${Date.now()}`;
   const token = makeToken(userId);
+  await redis.sadd(`session:${SESSION_ID}:participants`, userId);
 
   for (const questionId of VALID_QUESTION_IDS) {
     const res = await post(`/sessions/${SESSION_ID}/quiz/submit`, { questionId, answer: 'O' }, token);
@@ -125,6 +123,7 @@ test('1. isRetryStart 없이 첫 응시 3문항을 제출해도 daily count가 �
 test('2~3. 재응시 시작 1회, 2회는 통과하고 3번째 재응시 시작은 429를 반환한다', async () => {
   const userId = `student-185-2-${Date.now()}`;
   const token = makeToken(userId);
+  await redis.sadd(`session:${SESSION_ID}:participants`, userId);
 
   // 1차 재응시 세트 (첫 문항만 isRetryStart:true)
   const retry1 = await post(`/sessions/${SESSION_ID}/quiz/submit`, { questionId: 'q1', answer: 'O', isRetryStart: true }, token);
@@ -147,6 +146,7 @@ test('2~3. 재응시 시작 1회, 2회는 통과하고 3번째 재응시 시작�
 test('4. isRetryStart가 boolean이 아니면 400을 반환한다', async () => {
   const userId = `student-185-4-${Date.now()}`;
   const token = makeToken(userId);
+  await redis.sadd(`session:${SESSION_ID}:participants`, userId);
 
   const res = await post(`/sessions/${SESSION_ID}/quiz/submit`, { questionId: 'q1', answer: 'O', isRetryStart: 'true' }, token);
   expect(res.status).toBe(400);
@@ -157,6 +157,7 @@ test('4. isRetryStart가 boolean이 아니면 400을 반환한다', async () => 
 test('5. 잘못된 questionId로 재응시를 시작하면 404를 반환하고 daily count는 소모되지 않는다', async () => {
   const userId = `student-185-5-${Date.now()}`;
   const token = makeToken(userId);
+  await redis.sadd(`session:${SESSION_ID}:participants`, userId);
 
   const badRes = await post(
     `/sessions/${SESSION_ID}/quiz/submit`,

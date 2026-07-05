@@ -19,20 +19,17 @@ const redis = require('../src/lib/redis');
 const PORT = 3102;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const SESSION_ID = `test-session-quiz-${Date.now()}`;
-const CLASS_ID = 'test-class-quiz';
 const QUESTION_ID = 'test-question-quiz-1';
 const USER_ID = `test-student-quiz-1-${Date.now()}`;
 const USER_ID_2 = `test-student-quiz-2-${Date.now()}`;
 
 const mockSessionFindUnique = jest.fn();
-const mockClassMemberFindFirst = jest.fn();
 const mockQuizQuestionFindFirst = jest.fn();
 const mockQuizAnswerUpsert = jest.fn();
 
 jest.mock('@prisma/client', () => ({
   PrismaClient: jest.fn().mockImplementation(() => ({
     session: { findUnique: mockSessionFindUnique },
-    classMember: { findFirst: mockClassMemberFindFirst },
     quizQuestion: { findFirst: mockQuizQuestionFindFirst },
     quizAnswer: { upsert: mockQuizAnswerUpsert },
   })),
@@ -81,6 +78,7 @@ async function cleanupRedis() {
   const kstDate = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, '');
   await redis.del(`quiz:count:${USER_ID}:${kstDate}`);
   await redis.del(`quiz:count:${USER_ID_2}:${kstDate}`);
+  await redis.del(`session:${SESSION_ID}:participants`);
 }
 
 beforeAll(async () => {
@@ -100,10 +98,10 @@ beforeEach(async () => {
   jest.clearAllMocks();
   await cleanupRedis();
 
-  mockSessionFindUnique.mockResolvedValue({ classId: CLASS_ID, status: 'ARCHIVED' });
-  mockClassMemberFindFirst.mockResolvedValue({ id: 'membership-1' });
+  mockSessionFindUnique.mockResolvedValue({ status: 'ARCHIVED' });
   mockQuizQuestionFindFirst.mockResolvedValue({ answer: 'O' });
   mockQuizAnswerUpsert.mockResolvedValue({});
+  await redis.sadd(`session:${SESSION_ID}:participants`, USER_ID, USER_ID_2);
 });
 
 test('오답 제출 후 재응시로 정답 제출 시 isCorrect가 true로 갱신된다', async () => {
