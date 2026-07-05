@@ -2313,18 +2313,15 @@ app.post(ROUTES.QUIZ_SUBMIT, requireAuth, async (req, res) => {
     // 3. 세션 확인 — ARCHIVED만 허용
     const dbSession = await prisma.session.findUnique({
       where: { id: sessionId },
-      select: { classId: true, status: true },
+      select: { status: true },
     });
     if (!dbSession) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
     if (dbSession.status !== 'ARCHIVED')
       return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_NOT_ENDED');
 
-    // 4. classMember 검증
-    const membership = await prisma.classMember.findFirst({
-      where: { classId: dbSession.classId, userId },
-      select: { id: true },
-    });
-    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+    // 4. 세션 참여 여부 검증 (QR 입장 학생은 ClassMember가 아니므로 participants Set 기준으로 확인)
+    const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(userId));
+    if (!isParticipant) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
 
     // 5. 문항 조회 + 채점 — 재응시 횟수 검증보다 먼저 수행해서, 잘못된 questionId로는
     //    재응시 횟수가 소모되지 않도록 함
@@ -2393,16 +2390,13 @@ app.get(ROUTES.QUIZ_RESULT, requireAuth, async (req, res) => {
     // 1. 세션 확인 (DB 기준)
     const session = await prisma.session.findUnique({
       where: { id: sessionId },
-      select: { classId: true, status: true },
+      select: { status: true },
     });
     if (!session) return sendHttpError(res, 404, ERRORS.SESSION_NOT_FOUND, 'SESSION_NOT_FOUND');
 
-    // 2. classMember 검증
-    const membership = await prisma.classMember.findFirst({
-      where: { classId: session.classId, userId },
-      select: { id: true },
-    });
-    if (!membership) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_MEMBER');
+    // 2. 세션 참여 여부 검증 (participants Set 기준)
+    const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(userId));
+    if (!isParticipant) return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
 
     // 3. role 검증
     if (!['teacher', 'student'].includes(req.role))
