@@ -14,6 +14,7 @@ const fs = require('fs');
 const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
 const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
 const bcrypt = require('bcryptjs'); // ✅ #124
+const { getAuthorizationUrl, exchangeCodeForToken, fetchProfile } = require('./auth/oauthProviders'); // ✅ 소셜 로그인
 
 
 if (process.env.NODE_ENV !== "production") {
@@ -779,6 +780,10 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
 app.use(express.json());
 app.use(express.static(APP_CONFIG.STATIC_DIR));
 
+// ✅ 소셜 로그인: 역할 미확정 유저에게 발급되는 임시 토큰(scope: role_setup)이
+// 호출할 수 있는 경로. 이 경로 밖에서는 role_setup 토큰과 role이 없는 토큰 모두 차단한다.
+const ROLE_SETUP_ALLOWED_PATHS = new Set([ROUTES.AUTH_ROLE]);
+
 // ✅ #29: HTTP 인증 미들웨어
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -793,8 +798,17 @@ function requireAuth(req, res, next) {
     if (!payload?.userId) {
       return sendHttpError(res, 401, ERRORS.UNAUTHORIZED, "INVALID_TOKEN_PAYLOAD");
     }
+
+    // role_setup 임시 토큰이거나(소셜 최초 가입) role이 아예 없는 토큰은
+    // 역할 확정 API 외의 모든 API에서 차단한다.
+    const isRoleSetupToken = payload.scope === "role_setup";
+    if ((isRoleSetupToken || !payload.role) && !ROLE_SETUP_ALLOWED_PATHS.has(req.path)) {
+      return sendHttpError(res, 403, ERRORS.ROLE_REQUIRED, "ROLE_REQUIRED");
+    }
+
     req.userId = payload.userId;
     req.role = payload.role;
+    req.scope = payload.scope;
     next();
   } catch (e) {
     return sendHttpError(res, 401, ERRORS.UNAUTHORIZED, "INVALID_TOKEN");
@@ -1897,6 +1911,189 @@ app.post(ROUTES.AUTH_LOGIN, async (req, res) => {
   }
 });
 
+
+// ✅ 소셜 로그인: 인증 시작 — 프론트가 Custom Tabs/ASWebAuthenticationSession으로 오픈
+// GET /auth/google, GET /auth/kakao
+async function startOAuth(req, res, provider) {
+  try {
+    const state = randomUUID();
+    await redis.set(`oauth:state:${state}`, provider, 'EX', APP_CONFIG.OAUTH_STATE_TTL_SECONDS);
+    return res.redirect(getAuthorizationUrl(provider, state));
+  } catch (err) {
+    logger.error('oauth start failed', { provider, err: err?.message });
+    return sendHttpError(res, 500, ERRORS.PROVIDER_ERROR, 'OAUTH_START_FAILED');
+  }
+}
+app.get(ROUTES.AUTH_GOOGLE, (req, res) => startOAuth(req, res, 'google'));
+app.get(ROUTES.AUTH_KAKAO, (req, res) => startOAuth(req, res, 'kakao'));
+
+// ✅ 소셜 로그인: Provider redirect_uri — Provider가 인가 코드를 실어 이 엔드포인트로 리다이렉트
+// GET /auth/google/callback, GET /auth/kakao/callback
+// state 생성·검증과 Provider 인가 코드 교환은 전부 여기(백엔드)에서 처리하고,
+// 앱에는 JWT 대신 짧은 만료의 1회용 코드만 전달한다.
+async function handleOAuthCallback(req, res, provider) {
+  const { code, state, error: providerError } = req.query;
+
+  const redirectFail = (errorCode) =>
+    res.redirect(`${APP_CONFIG.APP_CALLBACK_URL}?error=${encodeURIComponent(errorCode)}`);
+
+  // Provider가 콜백 쿼리로 에러를 전달한 경우 — 사용자가 동의 화면에서 거부한 것(access_denied)만
+  // ACCESS_DENIED로 구분하고, 그 외 Provider 측 에러(설정 오류 등)는 PROVIDER_ERROR로 처리한다.
+  if (providerError) {
+    logger.info('oauth provider error', { provider, error: providerError });
+    return redirectFail(providerError === 'access_denied' ? ERRORS.ACCESS_DENIED : ERRORS.PROVIDER_ERROR);
+  }
+
+  if (!code || !state || typeof state !== 'string') {
+    return redirectFail(ERRORS.INVALID_STATE);
+  }
+
+  try {
+    const stateKey = `oauth:state:${state}`;
+    const savedProvider = await redis.get(stateKey);
+    if (!savedProvider || savedProvider !== provider) {
+      return redirectFail(ERRORS.INVALID_STATE);
+    }
+    await redis.del(stateKey); // state는 1회용
+
+    const accessToken = await exchangeCodeForToken(provider, code);
+    const profile = await fetchProfile(provider, accessToken);
+
+    let user = await prisma.user.findUnique({
+      where: { provider_providerId: { provider, providerId: profile.providerId } },
+      select: { id: true, role: true },
+    });
+
+    if (!user) {
+      // 소셜 이메일이 기존 local 계정에 이미 쓰이고 있으면 자동 연결하지 않고 거부한다.
+      // (계정 탈취 위험 — 이메일만으로 다른 계정에 슬쩍 연결되면 안 됨)
+      if (profile.email) {
+        const existingByEmail = await prisma.user.findUnique({
+          where: { email: profile.email },
+          select: { id: true },
+        });
+        if (existingByEmail) {
+          return redirectFail(ERRORS.EMAIL_ALREADY_REGISTERED);
+        }
+      }
+
+      user = await prisma.user.create({
+        data: {
+          provider,
+          providerId: profile.providerId,
+          email: profile.email,
+          name: profile.name,
+          role: null,
+        },
+        select: { id: true, role: true },
+      });
+    }
+
+    const oneTimeCode = randomUUID();
+    await redis.set(`oauth:code:${oneTimeCode}`, user.id, 'EX', APP_CONFIG.OAUTH_CODE_TTL_SECONDS);
+
+    return res.redirect(`${APP_CONFIG.APP_CALLBACK_URL}?code=${encodeURIComponent(oneTimeCode)}`);
+  } catch (err) {
+    if (err?.code === 'P2002') {
+      return redirectFail(ERRORS.EMAIL_ALREADY_REGISTERED);
+    }
+    const knownCode = Object.values(ERRORS).includes(err?.code) ? err.code : ERRORS.PROVIDER_ERROR;
+    logger.error('oauth callback failed', { provider, err: err?.message });
+    return redirectFail(knownCode);
+  }
+}
+app.get(ROUTES.AUTH_GOOGLE_CALLBACK, (req, res) => handleOAuthCallback(req, res, 'google'));
+app.get(ROUTES.AUTH_KAKAO_CALLBACK, (req, res) => handleOAuthCallback(req, res, 'kakao'));
+
+// ✅ 소셜 로그인: 1회용 코드 → JWT 교환
+// POST /auth/exchange  Body: { code }
+app.post(ROUTES.AUTH_EXCHANGE, async (req, res) => {
+  const { code } = req.body;
+
+  if (!code || typeof code !== 'string') {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'CODE_REQUIRED');
+  }
+
+  try {
+    const codeKey = `oauth:code:${code}`;
+    // GET+DEL은 동시에 같은 code로 요청 두 개가 들어오면 둘 다 GET에 성공할 수 있는 race가 있다.
+    // GETDEL로 조회+폐기를 원자적으로 처리해 code가 정확히 한 번만 소비되게 한다.
+    const userId = await redis.getdel(codeKey);
+    if (!userId) {
+      return sendHttpError(res, 400, ERRORS.EXCHANGE_FAILED, 'CODE_INVALID_OR_EXPIRED');
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, name: true, email: true, role: true, createdAt: true },
+    });
+    if (!user) {
+      return sendHttpError(res, 400, ERRORS.EXCHANGE_FAILED, 'USER_NOT_FOUND');
+    }
+
+    if (!user.role) {
+      const tempToken = signToken({ userId: user.id, role: null, scope: 'role_setup' });
+      logger.info('oauth exchange: role selection required', { userId: user.id });
+      return res.json({
+        requiresRoleSelection: true,
+        token: tempToken,
+        user: { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt },
+      });
+    }
+
+    const token = signToken({ userId: user.id, role: user.role });
+    logger.info('oauth exchange success', { userId: user.id, role: user.role });
+    return res.json({
+      requiresRoleSelection: false,
+      token,
+      user: { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt },
+    });
+  } catch (err) {
+    logger.error('auth exchange failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.EXCHANGE_FAILED, 'EXCHANGE_FAILED');
+  }
+});
+
+// ✅ 소셜 로그인: 최초 역할 확정 (role_setup 임시 토큰으로만 접근 가능하되, 이미 role이 있으면 409)
+// PATCH /auth/role  Header: Authorization: Bearer {role_setup 임시 토큰}  Body: { role }
+app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
+  // requireAuth는 role_setup 토큰이 이 경로를 "지나가게" 허용할 뿐, 일반 토큰도 막지는 않는다
+  // (role이 있는 사용자의 정상 토큰도 통과함). 여기서는 role_setup 임시 토큰만 명시적으로 허용한다.
+  if (req.scope !== 'role_setup') {
+    return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'ROLE_SETUP_TOKEN_REQUIRED');
+  }
+
+  const { role } = req.body;
+
+  if (!role || !['teacher', 'student'].includes(role)) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'INVALID_ROLE');
+  }
+
+  try {
+    // updateMany + count 체크로 "role이 null일 때만 갱신"을 원자적으로 처리한다.
+    // (동시 재시도/중복 요청에도 안전 — 이미 확정된 계정은 무조건 409)
+    const result = await prisma.user.updateMany({
+      where: { id: req.userId, role: null },
+      data: { role },
+    });
+
+    if (result.count === 0) {
+      return sendHttpError(res, 409, ERRORS.ROLE_ALREADY_SET, 'ROLE_ALREADY_SET');
+    }
+
+    const updated = await prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { id: true, name: true, email: true, role: true, createdAt: true },
+    });
+
+    const token = signToken({ userId: updated.id, role: updated.role });
+    logger.info('user role confirmed', { userId: updated.id, role: updated.role });
+    return res.json({ token, user: updated });
+  } catch (err) {
+    logger.error('role confirm failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'ROLE_CONFIRM_FAILED');
+  }
+});
 
 app.post(ROUTES.SESSION_CREATE, async (req, res) => {
 const { classId, materialId, title, capacity, password } = req.body;
