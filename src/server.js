@@ -823,8 +823,11 @@ function requireTeacherRole(req, res, next) {
   next();
 }
 
-// ✅ #29: class 멤버십 검증 미들웨어
-async function requireClassMember(req, res, next) {
+// ✅ #29: class 접근 권한 검증 미들웨어
+// ClassMember만 허용하는 게 아니라 "ClassMember 이거나 해당 class의 세션 참여자"면 통과시킨다.
+// QR/직접입력으로 입장한 학생은 ClassMember가 아니므로, sessionId 쿼리파라미터가 함께 오면
+// 세션 참여 여부(participants Set, quiz/export/pdf와 동일 기준)로 대체 허용한다.
+async function requireClassAccess(req, res, next) {
   const classId = (req.query.classId || "").toString().trim();
 
   if (!classId) {
@@ -837,14 +840,32 @@ async function requireClassMember(req, res, next) {
       select: { id: true, roleInClass: true },
     });
 
-    if (!membership) {
-      return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
+    if (membership) {
+      req.roleInClass = membership.roleInClass;
+      return next();
     }
 
-    req.roleInClass = membership.roleInClass;
-    next();
+    const sessionId = (req.query.sessionId || "").toString().trim();
+    if (sessionId) {
+      const session = await prisma.session.findUnique({
+        where: { id: sessionId },
+        select: { classId: true },
+      });
+
+      if (session?.classId === classId) {
+        const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(req.userId));
+        if (isParticipant) {
+          req.roleInClass = null;
+          return next();
+        }
+      }
+    }
+
+    // 에러 코드는 하위 호환을 위해 NOT_CLASS_MEMBER 유지 — 실제로는
+    // "ClassMember도 아니고 세션 참여자로도 확인 안 됨"을 의미한다.
+    return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
   } catch (e) {
-    logger.error("requireClassMember failed", { err: e?.message });
+    logger.error("requireClassAccess failed", { err: e?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR ?? "INTERNAL_ERROR", "INTERNAL_ERROR");
   }
 }
@@ -1215,7 +1236,7 @@ app.post(
  * 응답:
  * { items: [{ id,type,url,classId,createdAt,subjects:[{id,name}]}], count }
  */
-app.get("/materials", requireAuth, requireClassMember, async (req, res) => {
+app.get("/materials", requireAuth, requireClassAccess, async (req, res) => {
   try {
     const classId = (req.query.classId || "").toString().trim();
     const subjectId = (req.query.subjectId || "").toString().trim();
