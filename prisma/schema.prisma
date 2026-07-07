@@ -28,6 +28,7 @@ model User {
   email        String?       @unique
   name         String?
   role         String?       // 소셜 로그인 최초 가입 시 역할 선택 전에는 null
+  studentNumber String?      // 학생 전용 전역 프로필 필드. teacher는 사용하지 않음(항상 null)
   createdAt    DateTime      @default(now())
   classes      Class[]       @relation("TeacherClasses")
   ClassMember  ClassMember[]

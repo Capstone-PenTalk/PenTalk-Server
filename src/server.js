@@ -1778,6 +1778,15 @@ app.post('/auth/dev-login', (req, res) => {
 
 });
 
+// 학번: 숫자만, 4~20자 (프론트 확인: 숫자 전용, 하이픈 불가, 학교마다 자리수가 달라 가변 범위 — 최소 4자리)
+// 호출부에서 이미 trim된 값을 넘기므로 여기서는 다시 trim하지 않는다.
+function isValidStudentNumber(studentNumber) {
+  return (
+    typeof studentNumber === 'string' &&
+    /^[0-9]{4,20}$/.test(studentNumber)
+  );
+}
+
 // ✅ #172: 아이디 중복 확인
 // GET /auth/check-id?loginId=xxx
 app.get(ROUTES.AUTH_CHECK_ID, async (req, res) => {
@@ -1801,9 +1810,9 @@ app.get(ROUTES.AUTH_CHECK_ID, async (req, res) => {
 
 // ✅ #172: 회원가입
 // POST /auth/signup
-// Body: { loginId, password, name, role }
+// Body: { loginId, password, name, role, studentNumber(role=student일 때 필수) }
 app.post(ROUTES.AUTH_SIGNUP, async (req, res) => {
-  const { loginId, password, name, role } = req.body;
+  const { loginId, password, name, role, studentNumber } = req.body;
 
   // loginId: 영문·숫자·언더스코어, 4~20자
   if (
@@ -1835,6 +1844,17 @@ app.post(ROUTES.AUTH_SIGNUP, async (req, res) => {
     return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'INVALID_ROLE');
   }
 
+  // 학번: student만 필수. teacher가 보내도 저장하지 않는다.
+  const normalizedStudentNumber = typeof studentNumber === 'string' ? studentNumber.trim() : '';
+  if (role === 'student') {
+    if (!normalizedStudentNumber) {
+      return sendHttpError(res, 400, ERRORS.STUDENT_NUMBER_REQUIRED, 'STUDENT_NUMBER_REQUIRED');
+    }
+    if (!isValidStudentNumber(normalizedStudentNumber)) {
+      return sendHttpError(res, 400, ERRORS.INVALID_STUDENT_NUMBER, 'INVALID_STUDENT_NUMBER');
+    }
+  }
+
   try {
     const existing = await prisma.user.findUnique({
       where: { loginId: loginId.trim() },
@@ -1852,8 +1872,9 @@ app.post(ROUTES.AUTH_SIGNUP, async (req, res) => {
         passwordHash,
         name: name.trim(),
         role,
+        studentNumber: role === 'student' ? normalizedStudentNumber : null,
       },
-      select: { id: true, loginId: true, name: true, role: true, createdAt: true },
+      select: { id: true, loginId: true, name: true, role: true, studentNumber: true, createdAt: true },
     });
 
     const token = signToken({ userId: user.id, role: user.role });
@@ -1885,7 +1906,7 @@ app.post(ROUTES.AUTH_LOGIN, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { loginId: loginId.trim() },
-      select: { id: true, loginId: true, name: true, role: true, passwordHash: true, createdAt: true },
+      select: { id: true, loginId: true, name: true, role: true, studentNumber: true, passwordHash: true, createdAt: true },
     });
 
     // 아이디 없음 / 비밀번호 불일치 모두 동일 에러 (사용자 열거 방지)
@@ -1903,7 +1924,16 @@ app.post(ROUTES.AUTH_LOGIN, async (req, res) => {
     logger.info('user logged in', { userId: user.id, role: user.role });
     return res.json({
       token,
-      user: { id: user.id, loginId: user.loginId, name: user.name, role: user.role, createdAt: user.createdAt },
+      // 마이그레이션 이전 기존 학생 계정은 studentNumber가 없을 수 있어 프론트가 입력 화면으로 유도
+      requiresProfileCompletion: user.role === 'student' && !user.studentNumber,
+      user: {
+        id: user.id,
+        loginId: user.loginId,
+        name: user.name,
+        role: user.role,
+        studentNumber: user.studentNumber,
+        createdAt: user.createdAt,
+      },
     });
   } catch (err) {
     logger.error('login failed', { err: err?.message });
@@ -2025,7 +2055,7 @@ app.post(ROUTES.AUTH_EXCHANGE, async (req, res) => {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, name: true, email: true, role: true, createdAt: true },
+      select: { id: true, name: true, email: true, role: true, studentNumber: true, createdAt: true },
     });
     if (!user) {
       return sendHttpError(res, 400, ERRORS.EXCHANGE_FAILED, 'USER_NOT_FOUND');
@@ -2037,7 +2067,7 @@ app.post(ROUTES.AUTH_EXCHANGE, async (req, res) => {
       return res.json({
         requiresRoleSelection: true,
         token: tempToken,
-        user: { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt },
+        user: { id: user.id, name: user.name, email: user.email, role: user.role, studentNumber: user.studentNumber, createdAt: user.createdAt },
       });
     }
 
@@ -2045,8 +2075,10 @@ app.post(ROUTES.AUTH_EXCHANGE, async (req, res) => {
     logger.info('oauth exchange success', { userId: user.id, role: user.role });
     return res.json({
       requiresRoleSelection: false,
+      // 마이그레이션 이전 기존 학생 계정은 studentNumber가 없을 수 있어 프론트가 입력 화면으로 유도
+      requiresProfileCompletion: user.role === 'student' && !user.studentNumber,
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt },
+      user: { id: user.id, name: user.name, email: user.email, role: user.role, studentNumber: user.studentNumber, createdAt: user.createdAt },
     });
   } catch (err) {
     logger.error('auth exchange failed', { err: err?.message });
@@ -2055,7 +2087,7 @@ app.post(ROUTES.AUTH_EXCHANGE, async (req, res) => {
 });
 
 // ✅ 소셜 로그인: 최초 역할 확정 (role_setup 임시 토큰으로만 접근 가능하되, 이미 role이 있으면 409)
-// PATCH /auth/role  Header: Authorization: Bearer {role_setup 임시 토큰}  Body: { role }
+// PATCH /auth/role  Header: Authorization: Bearer {role_setup 임시 토큰}  Body: { role, studentNumber(role=student일 때 필수) }
 app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
   // requireAuth는 role_setup 토큰이 이 경로를 "지나가게" 허용할 뿐, 일반 토큰도 막지는 않는다
   // (role이 있는 사용자의 정상 토큰도 통과함). 여기서는 role_setup 임시 토큰만 명시적으로 허용한다.
@@ -2063,10 +2095,21 @@ app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
     return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'ROLE_SETUP_TOKEN_REQUIRED');
   }
 
-  const { role } = req.body;
+  const { role, studentNumber } = req.body;
 
   if (!role || !['teacher', 'student'].includes(role)) {
     return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'INVALID_ROLE');
+  }
+
+  // 학번: student만 필수. teacher가 보내도 저장하지 않는다.
+  const normalizedStudentNumber = typeof studentNumber === 'string' ? studentNumber.trim() : '';
+  if (role === 'student') {
+    if (!normalizedStudentNumber) {
+      return sendHttpError(res, 400, ERRORS.STUDENT_NUMBER_REQUIRED, 'STUDENT_NUMBER_REQUIRED');
+    }
+    if (!isValidStudentNumber(normalizedStudentNumber)) {
+      return sendHttpError(res, 400, ERRORS.INVALID_STUDENT_NUMBER, 'INVALID_STUDENT_NUMBER');
+    }
   }
 
   try {
@@ -2074,7 +2117,7 @@ app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
     // (동시 재시도/중복 요청에도 안전 — 이미 확정된 계정은 무조건 409)
     const result = await prisma.user.updateMany({
       where: { id: req.userId, role: null },
-      data: { role },
+      data: { role, studentNumber: role === 'student' ? normalizedStudentNumber : null },
     });
 
     if (result.count === 0) {
@@ -2083,7 +2126,7 @@ app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
 
     const updated = await prisma.user.findUnique({
       where: { id: req.userId },
-      select: { id: true, name: true, email: true, role: true, createdAt: true },
+      select: { id: true, name: true, email: true, role: true, studentNumber: true, createdAt: true },
     });
 
     const token = signToken({ userId: updated.id, role: updated.role });
@@ -2092,6 +2135,38 @@ app.patch(ROUTES.AUTH_ROLE, requireAuth, async (req, res) => {
   } catch (err) {
     logger.error('role confirm failed', { err: err?.message });
     return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'ROLE_CONFIRM_FAILED');
+  }
+});
+
+// ✅ 학번 등록/수정 (기존 학생 계정용 — 최초 role 확정 시가 아니라 언제든 수정 가능)
+// PATCH /auth/profile  Header: Authorization: Bearer {일반 토큰}  Body: { studentNumber }
+app.patch(ROUTES.AUTH_PROFILE, requireAuth, async (req, res) => {
+  if (req.role !== 'student') {
+    return sendHttpError(res, 403, ERRORS.STUDENT_ONLY, 'STUDENT_ONLY');
+  }
+
+  const { studentNumber } = req.body;
+  const normalizedStudentNumber = typeof studentNumber === 'string' ? studentNumber.trim() : '';
+
+  if (!normalizedStudentNumber) {
+    return sendHttpError(res, 400, ERRORS.STUDENT_NUMBER_REQUIRED, 'STUDENT_NUMBER_REQUIRED');
+  }
+  if (!isValidStudentNumber(normalizedStudentNumber)) {
+    return sendHttpError(res, 400, ERRORS.INVALID_STUDENT_NUMBER, 'INVALID_STUDENT_NUMBER');
+  }
+
+  try {
+    const updated = await prisma.user.update({
+      where: { id: req.userId },
+      data: { studentNumber: normalizedStudentNumber },
+      select: { id: true, name: true, email: true, loginId: true, role: true, studentNumber: true, createdAt: true },
+    });
+
+    logger.info('student number updated', { userId: updated.id });
+    return res.json({ requiresProfileCompletion: false, user: updated });
+  } catch (err) {
+    logger.error('profile update failed', { err: err?.message });
+    return sendHttpError(res, 500, ERRORS.INTERNAL_ERROR, 'PROFILE_UPDATE_FAILED');
   }
 });
 
