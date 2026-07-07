@@ -12,6 +12,7 @@ const ROUTES = {
   AUTH_KAKAO_CALLBACK:  '/auth/kakao/callback',    // GET: Provider redirect_uri
   AUTH_EXCHANGE:        '/auth/exchange',          // POST: 1회용 코드 → JWT 교환
   AUTH_ROLE:            '/auth/role',              // PATCH: 최초 역할 확정
+  AUTH_PROFILE:         '/auth/profile',           // PATCH: 학생 학번 등록/수정
 
   CLASS_CREATE: '/classes',           // ✅ #138 POST
   CLASS_GET:    '/classes/:classId',  // ✅ #138 GET
