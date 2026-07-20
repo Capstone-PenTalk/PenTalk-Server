@@ -1186,13 +1186,13 @@ app.post(
         return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_CLASS_TEACHER');
       }
 
-      const { url } = await saveFile(req, req.file);
+      const { url, name } = await saveFile(req, req.file);
 
       const material = await prisma.material.create({
         data: {
           type: 'pdf',
           url,
-          name: req.file.originalname,
+          name,
           classId,
         },
         select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
@@ -2758,7 +2758,7 @@ app.post(
         return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, 'SESSION_NOT_ACTIVE');
 
       // 4. 파일 업로드 (트랜잭션 외부 — S3는 롤백 불가)
-      const { url } = await saveFile(req, req.file);
+      const { url, name } = await saveFile(req, req.file);
 
       // 5. Material 생성 + Session 연결을 트랜잭션으로 묶음
       const material = await prisma.$transaction(async (tx) => {
@@ -2766,7 +2766,7 @@ app.post(
           data: {
             type: 'pdf',
             url,
-            name: req.file.originalname,
+            name,
             classId: session.classId,
           },
           select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },

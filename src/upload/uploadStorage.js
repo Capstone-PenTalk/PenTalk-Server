@@ -24,7 +24,9 @@ async function saveFile(req, file) {
   // material.url에는 S3 key를 저장 (URL 아님). 조회 시 presigned URL로 변환.
   const key = `pdfs/${req.userId}/${uuidv4()}.pdf`;
   await uploadBuffer(key, file.buffer, 'application/pdf');
-  return { url: key };
+  // multipart/form-data는 파일명 인코딩을 명시하지 않아 multer가 latin1로 디코딩함 -> utf8로 재해석
+  const name = Buffer.from(file.originalname, 'latin1').toString('utf8');
+  return { url: key, name };
 }
 
 const upload = multer({
