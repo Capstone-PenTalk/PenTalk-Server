@@ -58,8 +58,25 @@ model Material {
   MaterialSubject MaterialSubject[]
   MaterialTag     MaterialTag[]
   sessions        Session[]
+  MaterialPage    MaterialPage[]
 
   @@index([classId, createdAt])
+}
+
+// 교사/학생 기기별 PDF 렌더러 차이(PDFKit vs PdfRenderer)로 판서 좌표가 어긋나는 문제 해결을 위해
+// 업로드 시점에 서버가 페이지별 PNG로 래스터화해서 저장. 모든 클라이언트가 동일 이미지+치수 기준으로 렌더링.
+model MaterialPage {
+  id         String   @id @default(cuid())
+  materialId String
+  pageNumber Int
+  imageKey   String   // S3 객체 키 (Material.url과 동일 관례, presigned URL은 조회 시점에 생성)
+  width      Int
+  height     Int
+  createdAt  DateTime @default(now())
+  Material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  @@unique([materialId, pageNumber])
+  @@index([materialId])
 }
 
 model ClassMember {

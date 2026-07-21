@@ -22,11 +22,14 @@ const TEACHER_ID = 'test-teacher-93';
 // ── Prisma mock ────────────────────────────────────────────────────────────
 const mockClassFindUnique = jest.fn();
 const mockMaterialCreate = jest.fn();
+const mockMaterialDelete = jest.fn();
+const mockMaterialPageCreateMany = jest.fn();
 
 jest.mock('@prisma/client', () => ({
   PrismaClient: jest.fn().mockImplementation(() => ({
     class: { findUnique: mockClassFindUnique },
-    material: { create: mockMaterialCreate },
+    material: { create: mockMaterialCreate, delete: mockMaterialDelete },
+    materialPage: { createMany: mockMaterialPageCreateMany },
   })),
 }));
 
@@ -36,6 +39,13 @@ jest.mock('../src/lib/s3', () => ({
   uploadString: jest.fn().mockResolvedValue(undefined),
   downloadString: jest.fn().mockResolvedValue(''),
   getPresignedUrl: jest.fn().mockResolvedValue('https://example.com/presigned'),
+}));
+
+// ── PDF 래스터화 mock (실제 pdftoppm 바이너리/유효한 PDF 구조 불필요) ────────────
+jest.mock('../src/upload/pdfRasterize', () => ({
+  rasterizePdfToPages: jest.fn().mockResolvedValue([
+    { pageNumber: 1, imageKey: 'pdfs/pages/material-93/1.png', width: 100, height: 100 },
+  ]),
 }));
 
 let serverInstance;
@@ -116,6 +126,8 @@ beforeEach(() => {
   mockMaterialCreate.mockImplementation(({ data }) =>
     Promise.resolve({ id: 'material-93', type: data.type, url: data.url, name: data.name, classId: data.classId, createdAt: new Date() }),
   );
+  mockMaterialPageCreateMany.mockResolvedValue({ count: 1 });
+  mockMaterialDelete.mockResolvedValue({});
 });
 
 describe('POST /materials/pdf 파일명 인코딩', () => {

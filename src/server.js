@@ -13,6 +13,8 @@ const fs = require('fs');
 
 const { upload, saveFile } = require('./upload/uploadStorage'); // ✅ #93
 const { uploadString, downloadString, getPresignedUrl } = require('./lib/s3'); // ✅ #108
+const { rasterizePdfToPages } = require('./upload/pdfRasterize');
+const { serializeMaterialWithPages } = require('./upload/materialSerializer');
 const bcrypt = require('bcryptjs'); // ✅ #124
 const { getAuthorizationUrl, exchangeCodeForToken, fetchProfile } = require('./auth/oauthProviders'); // ✅ 소셜 로그인
 
@@ -1188,7 +1190,7 @@ app.post(
 
       const { url, name } = await saveFile(req, req.file);
 
-      const material = await prisma.material.create({
+      const mat = await prisma.material.create({
         data: {
           type: 'pdf',
           url,
@@ -1198,7 +1200,25 @@ app.post(
         select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
       });
 
-      logger.info('material uploaded', { materialId: material.id, classId });
+      // 페이지 처리(pdftoppm+S3 업로드) + MaterialPage 저장은 느린 외부 I/O가 섞여있어 DB 트랜잭션 밖에서 처리
+      // (트랜잭션 안에 두면 커넥션을 오래 붙잡아 커넥션 풀 고갈 위험). 이 구간 전체가 실패하면
+      // 페이지 없는 Material 고아 행이 남지 않도록 하나의 try/catch로 묶어서 정리.
+      let material;
+      try {
+        const pages = await rasterizePdfToPages(req.file.buffer, mat.id);
+        await prisma.materialPage.createMany({
+          data: pages.map((p) => ({ materialId: mat.id, ...p })),
+        });
+        material = { ...mat, pages };
+      } catch (err) {
+        await prisma.material.delete({ where: { id: mat.id } }).catch(() => {});
+        const pageErr = new Error('MATERIAL_PAGE_PROCESSING_FAILED');
+        pageErr.code = 'MATERIAL_PAGE_PROCESSING_FAILED';
+        pageErr.cause = err;
+        throw pageErr;
+      }
+
+      logger.info('material uploaded', { materialId: material.id, classId, pageCount: material.pages.length });
 
       if (sessionId) {
         const [updatedSession] = await Promise.all([
@@ -1218,9 +1238,12 @@ app.post(
         logger.info('db session materialId synced', { sessionId, materialId: material.id });
       }
 
-      return res.status(201).json(material);
+      return res.status(201).json(await serializeMaterialWithPages(material, material.pages));
     } catch (err) {
-      logger.error('material upload failed', { err });
+      logger.error('material upload failed', { err: err?.message, cause: err?.cause?.message });
+      if (err?.code === 'MATERIAL_PAGE_PROCESSING_FAILED') {
+        return sendHttpError(res, 500, ERRORS.MATERIAL_PAGE_PROCESSING_FAILED, 'PAGE_PROCESSING_FAILED');
+      }
       return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
     }
   }
@@ -2334,22 +2357,16 @@ app.post(ROUTES.SESSION_JOIN, async (req, res) => {
     return sendHttpError(res, 409, ERRORS.SESSION_CAPACITY_EXCEEDED, "SESSION_CAPACITY_EXCEEDED");
   }
 
-  // 6. material 조회 및 presigned URL 생성
+  // 6. material 조회 및 페이지별 presigned URL 생성
   let material = null;
   const sessionMaterialId = session.materialId ?? null;
   if (sessionMaterialId) {
     const found = await prisma.material.findUnique({
       where: { id: sessionMaterialId },
-      select: { id: true, name: true, type: true, url: true },
+      select: { id: true, name: true, type: true, url: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
     });
-    if (found?.url) {
-      const downloadUrl = await getPresignedUrl(found.url);
-      material = {
-        id: found.id,
-        name: found.name,
-        type: found.type,
-        downloadUrl,
-      };
+    if (found) {
+      material = await serializeMaterialWithPages(found, found.MaterialPage);
     }
   }
 
@@ -2760,35 +2777,60 @@ app.post(
       // 4. 파일 업로드 (트랜잭션 외부 — S3는 롤백 불가)
       const { url, name } = await saveFile(req, req.file);
 
-      // 5. Material 생성 + Session 연결을 트랜잭션으로 묶음
-      const material = await prisma.$transaction(async (tx) => {
-        const mat = await tx.material.create({
-          data: {
-            type: 'pdf',
-            url,
-            name,
-            classId: session.classId,
-          },
-          select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
-        });
-
-        // updateMany 조건부 업데이트로 동시 업로드 race condition 방지
-        const updated = await tx.session.updateMany({
-          where: { id: sessionId, materialId: null, status: 'ACTIVE' },
-          data: { materialId: mat.id },
-        });
-
-        // count === 0이면 이미 다른 요청이 먼저 연결한 것 → 트랜잭션 롤백
-        if (updated.count === 0) {
-          const error = new Error('MATERIAL_ALREADY_SET');
-          error.code = 'MATERIAL_ALREADY_SET';
-          throw error;
-        }
-
-        return mat;
+      // 5. Material 생성
+      const mat = await prisma.material.create({
+        data: {
+          type: 'pdf',
+          url,
+          name,
+          classId: session.classId,
+        },
+        select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
       });
 
-      logger.info('session material uploaded', { sessionId, materialId: material.id });
+      // pdftoppm 실행 + S3 페이지 업로드는 느린 외부 I/O라 DB 트랜잭션 밖에서 처리
+      let pages;
+      try {
+        pages = await rasterizePdfToPages(req.file.buffer, mat.id);
+      } catch (err) {
+        await prisma.material.delete({ where: { id: mat.id } }).catch(() => {});
+        const pageErr = new Error('MATERIAL_PAGE_PROCESSING_FAILED');
+        pageErr.code = 'MATERIAL_PAGE_PROCESSING_FAILED';
+        pageErr.cause = err;
+        throw pageErr;
+      }
+
+      // 6. MaterialPage 저장 + Session 연결(race condition 방지)만 짧은 트랜잭션으로 묶음
+      let material;
+      try {
+        material = await prisma.$transaction(async (tx) => {
+          await tx.materialPage.createMany({
+            data: pages.map((p) => ({ materialId: mat.id, ...p })),
+          });
+
+          // updateMany 조건부 업데이트로 동시 업로드 race condition 방지
+          const updated = await tx.session.updateMany({
+            where: { id: sessionId, materialId: null, status: 'ACTIVE' },
+            data: { materialId: mat.id },
+          });
+
+          // count === 0이면 이미 다른 요청이 먼저 연결한 것 → 트랜잭션 롤백
+          if (updated.count === 0) {
+            const error = new Error('MATERIAL_ALREADY_SET');
+            error.code = 'MATERIAL_ALREADY_SET';
+            throw error;
+          }
+
+          return { ...mat, pages };
+        });
+      } catch (err) {
+        // 트랜잭션이 롤백되면 MaterialPage는 같이 롤백되지만 Material 행은 트랜잭션 밖에서 만들어졌으므로
+        // 페이지 없는 고아 행으로 남지 않도록 별도 정리
+        await prisma.material.delete({ where: { id: mat.id } }).catch(() => {});
+        throw err;
+      }
+
+      logger.info('session material uploaded', { sessionId, materialId: material.id, pageCount: material.pages.length });
 
       const updatedSession = await sessionStore.update(sessionId, { materialId: material.id });
 
@@ -2798,11 +2840,14 @@ app.post(
         logger.warn('redis session not found while syncing materialId', { sessionId, materialId: material.id });
       }
 
-      return res.status(201).json({ ok: true, material });
+      return res.status(201).json({ ok: true, material: await serializeMaterialWithPages(material, material.pages) });
     } catch (err) {
       if (err.code === 'MATERIAL_ALREADY_SET')
         return sendHttpError(res, 409, ERRORS.MATERIAL_ALREADY_SET, 'MATERIAL_ALREADY_SET');
-      logger.error('session material upload failed', { sessionId, err: err?.message });
+      logger.error('session material upload failed', { sessionId, err: err?.message, cause: err?.cause?.message });
+      if (err?.code === 'MATERIAL_PAGE_PROCESSING_FAILED') {
+        return sendHttpError(res, 500, ERRORS.MATERIAL_PAGE_PROCESSING_FAILED, 'PAGE_PROCESSING_FAILED');
+      }
       return sendHttpError(res, 500, ERRORS.MATERIAL_UPLOAD_FAILED, 'UPLOAD_FAILED');
     }
   }
@@ -2950,16 +2995,19 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
 
     let material = null;
     if (sessionMaterialId) {
-      material = await prisma.material.findUnique({
+      const found = await prisma.material.findUnique({
         where: { id: sessionMaterialId },
-        select: { id: true, name: true, type: true, url: true },
+        select: { id: true, name: true, type: true, url: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
       });
+      if (found) {
+        material = await serializeMaterialWithPages(found, found.MaterialPage);
+      }
     }
 
     socket.emit(SOCKET_EVENTS.JOIN_SUCCESS, {
       roomId,
       classId: session.classId,
-      materialId: material?.id ?? sessionMaterialId,
+      materialId: material?.materialId ?? sessionMaterialId,
       material,
       user: { userId: socket.data.userId, role: socket.data.role }
     });

@@ -114,6 +114,11 @@ CLIENT_ORIGIN=http://localhost:5173
 npm install
 ```
 
+PDF 업로드 시 서버 사이드 페이지 래스터화(pdftoppm)를 위해 `poppler-utils`가 필요합니다. Docker로 실행 시 이미지에 자동 설치되어 있으니 별도 조치가 필요 없고, 로컬에서 직접 `node src/server.js`로 실행하는 경우에만 아래처럼 설치하세요.
+```bash
+sudo apt-get install -y poppler-utils
+```
+
 ### 2. PostgreSQL 실행 및 DB 마이그레이션
 ```bash
 # DB 마이그레이션 적용
