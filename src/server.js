@@ -1308,27 +1308,34 @@ app.get("/materials", requireAuth, requireClassAccess, async (req, res) => {
             Tag: { select: { id: true, name: true } },
           },
         },
+        MaterialPage: { orderBy: { pageNumber: "asc" } },
       },
       take: 50,
     });
 
     // 4) 프론트 친화 포맷으로 변환
-    const formatted = items.map((m) => ({
-      id: m.id,
-      type: m.type,
-      name: m.name,
-      url: m.url,
-      classId: m.classId,
-      createdAt: m.createdAt,
-      subjects: (m.MaterialSubject || []).map((ms) => ({
-        id: ms.Subject.id,
-        name: ms.Subject.name,
-      })),
-      tags: (m.MaterialTag || []).map((mt) => ({
-        id: mt.Tag.id,
-        name: mt.Tag.name,
-      })),
-    }));
+    const formatted = await Promise.all(
+      items.map(async (m) => {
+        const { pages } = await serializeMaterialWithPages(m, m.MaterialPage);
+        return {
+          id: m.id,
+          type: m.type,
+          name: m.name,
+          url: m.url,
+          classId: m.classId,
+          createdAt: m.createdAt,
+          pages,
+          subjects: (m.MaterialSubject || []).map((ms) => ({
+            id: ms.Subject.id,
+            name: ms.Subject.name,
+          })),
+          tags: (m.MaterialTag || []).map((mt) => ({
+            id: mt.Tag.id,
+            name: mt.Tag.name,
+          })),
+        };
+      })
+    );
 
     return res.json({
       items: formatted,
