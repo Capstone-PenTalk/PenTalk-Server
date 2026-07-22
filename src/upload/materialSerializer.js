@@ -20,6 +20,7 @@ async function serializeMaterialWithPages(material, materialPages) {
     materialId: material.id,
     type: material.type,
     name: material.name ?? null,
+    sizeInBytes: material.sizeInBytes ?? null,
     pages,
   };
 }
