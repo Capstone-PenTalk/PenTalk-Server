@@ -52,6 +52,7 @@ model Material {
   type            String
   url             String
   name            String?           // ✅ #93: 원본 파일명. nullable인 이유: 기존 데이터(외부 URL 등록분)와의 호환. 신규 업로드분은 항상 채워짐.
+  sizeInBytes     Int?              // nullable인 이유: 필드 추가 이전 업로드분과의 호환. 신규 업로드분은 항상 채워짐.
   createdAt       DateTime          @default(now())
   classId         String
   class           Class             @relation(fields: [classId], references: [id], onDelete: Cascade)
@@ -145,9 +146,30 @@ model Session {
   endError      String?
   createdAt     DateTime        @default(now())
   quizQuestions QuizQuestion[]  // ✅ #60
+  participants  SessionParticipant[]
 
   @@index([classId, createdAt])
   @@index([status])
+}
+
+// 세션 종료(ARCHIVED) 이후에도 영구 보존되는 참여 기록. 학생이 세션에 한 번 정상 참여했다면
+// 세션 종료 여부와 무관하게 원본 자료 다운로드 권한을 계속 갖도록 하기 위함(Redis participants Set은 TTL로 소멸함).
+model SessionParticipant {
+  id         String   @id @default(cuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userId     String
+  // classId/materialId는 스냅샷일 뿐이며 권한 판단에는 절대 쓰이지 않는다.
+  // 다운로드/export 권한 판단은 항상 Session.classId / Session.materialId(현재 값)를 기준으로 한다.
+  classId    String
+  materialId String?
+  joinedAt     DateTime @default(now()) // 최초 참여 시각. upsert되어도 갱신되지 않음.
+  // 가장 최근 참여(재입장) 시각. @updatedAt이 아니라 JOIN_ROOM 코드에서 직접 세팅한다 —
+  // 향후 관리자 정정 등 다른 이유로 이 행이 update되어도 "마지막 참여 시각" 의미가 오염되지 않도록.
+  lastJoinedAt DateTime @default(now())
+
+  @@unique([sessionId, userId])
+  @@index([userId])
 }
 
 model QuizQuestion {

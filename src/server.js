@@ -559,7 +559,22 @@ app.post('/export/pdf', express.json({ limit: '5mb' }), requireAuth, async (req,
     }
 
     // ── 3. 권한 검증: 소켓으로 세션에 입장한 적 있는지 확인 ──────────
-    const isParticipant = await redis.sismember(`session:${sessionId}:participants`, String(req.userId));
+    // Redis participants Set은 TTL(세션 종료 후 최대 몇 시간)로 소멸하므로,
+    // 미스 시 영구 보존되는 SessionParticipant 기록으로 한 번 더 확인한다.
+    // Redis 연결 오류로 sismember 자체가 throw하는 경우도 DB fallback으로 넘어가야 하므로 별도로 감싼다.
+    let isParticipant = false;
+    try {
+      isParticipant = Boolean(await redis.sismember(`session:${sessionId}:participants`, String(req.userId)));
+    } catch (redisErr) {
+      logger.warn('export: redis participant check failed', { sessionId, userId: req.userId, err: redisErr?.message });
+    }
+    if (!isParticipant) {
+      const participant = await prisma.sessionParticipant.findUnique({
+        where: { sessionId_userId: { sessionId, userId: req.userId } },
+        select: { id: true },
+      });
+      isParticipant = !!participant;
+    }
     if (!isParticipant) {
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, 'NOT_SESSION_MEMBER');
     }
@@ -1195,9 +1210,10 @@ app.post(
           type: 'pdf',
           url,
           name,
+          sizeInBytes: req.file.size,
           classId,
         },
-        select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
+        select: { id: true, type: true, url: true, name: true, sizeInBytes: true, classId: true, createdAt: true },
       });
 
       // 페이지 처리(pdftoppm+S3 업로드) + MaterialPage 저장은 느린 외부 I/O가 섞여있어 DB 트랜잭션 밖에서 처리
@@ -1322,6 +1338,7 @@ app.get("/materials", requireAuth, requireClassAccess, async (req, res) => {
           type: m.type,
           name: m.name,
           url: m.url,
+          sizeInBytes: m.sizeInBytes ?? null,
           classId: m.classId,
           createdAt: m.createdAt,
           pages,
@@ -1359,8 +1376,11 @@ app.get("/materials", requireAuth, requireClassAccess, async (req, res) => {
 
 
 
+// ✅ 원본 PDF 다운로드 URL 발급. ClassMember가 아니어도 세션에 정상 참여한 이력(SessionParticipant)이
+// 있고 그 세션의 materialId가 요청 materialId와 일치하면 허용 (세션 종료 여부와 무관, 퀴즈 게이트 없음).
 app.get("/materials/:materialId/download-url", requireAuth, async (req, res) => {
   const { materialId } = req.params;
+  const sessionId = (req.query.sessionId || "").toString().trim();
   try {
     const material = await prisma.material.findUnique({
       where: { id: materialId },
@@ -1369,13 +1389,29 @@ app.get("/materials/:materialId/download-url", requireAuth, async (req, res) => 
     if (!material) {
       return sendHttpError(res, 404, ERRORS.MATERIAL_NOT_FOUND, "MATERIAL_NOT_FOUND");
     }
+
     const membership = await prisma.classMember.findFirst({
       where: { classId: material.classId, userId: req.userId },
       select: { id: true },
     });
-    if (!membership) {
+
+    let allowed = !!membership;
+
+    if (!allowed && sessionId) {
+      const participant = await prisma.sessionParticipant.findFirst({
+        where: {
+          userId: req.userId,
+          session: { id: sessionId, classId: material.classId, materialId },
+        },
+        select: { id: true },
+      });
+      allowed = !!participant;
+    }
+
+    if (!allowed) {
       return sendHttpError(res, 403, ERRORS.FORBIDDEN, "NOT_CLASS_MEMBER");
     }
+
     const url = await getPresignedUrl(material.url);
     return res.json({ url });
   } catch (err) {
@@ -2370,7 +2406,7 @@ app.post(ROUTES.SESSION_JOIN, async (req, res) => {
   if (sessionMaterialId) {
     const found = await prisma.material.findUnique({
       where: { id: sessionMaterialId },
-      select: { id: true, name: true, type: true, url: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
+      select: { id: true, name: true, type: true, url: true, sizeInBytes: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
     });
     if (found) {
       material = await serializeMaterialWithPages(found, found.MaterialPage);
@@ -2790,9 +2826,10 @@ app.post(
           type: 'pdf',
           url,
           name,
+          sizeInBytes: req.file.size,
           classId: session.classId,
         },
-        select: { id: true, type: true, url: true, name: true, classId: true, createdAt: true },
+        select: { id: true, type: true, url: true, name: true, sizeInBytes: true, classId: true, createdAt: true },
       });
 
       // pdftoppm 실행 + S3 페이지 업로드는 느린 외부 I/O라 DB 트랜잭션 밖에서 처리
@@ -2988,6 +3025,32 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     await redis.sadd(`session:${roomId}:participants`, String(socket.data.userId));
     await redis.expire(`session:${roomId}:participants`, APP_CONFIG.USER_SESSION_CACHE_TTL);
 
+    // ✅ 세션 종료 후에도 원본 자료 다운로드 권한을 유지하기 위한 영구 참여 기록
+    // (위 Redis participants Set은 TTL로 소멸하므로 별도 보존)
+    // classId/materialId는 감사 기록용 스냅샷일 뿐, 다운로드 권한 판단은 항상 session의 현재 값을 기준으로 한다.
+    await prisma.sessionParticipant
+      .upsert({
+        where: { sessionId_userId: { sessionId: roomId, userId: socket.data.userId } },
+        create: {
+          sessionId: roomId,
+          userId: socket.data.userId,
+          classId: session.classId,
+          materialId: session.materialId ?? null,
+        },
+        update: {
+          classId: session.classId,
+          materialId: session.materialId ?? null,
+          lastJoinedAt: new Date(),
+        },
+      })
+      .catch((e) => {
+        logger.error("sessionParticipant upsert failed", {
+          roomId,
+          userId: socket.data.userId,
+          err: e?.message,
+        });
+      });
+
     logger.info("✅join room success", {
       socketId: socket.id,
       userId: socket.data.userId,
@@ -3004,7 +3067,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     if (sessionMaterialId) {
       const found = await prisma.material.findUnique({
         where: { id: sessionMaterialId },
-        select: { id: true, name: true, type: true, url: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
+        select: { id: true, name: true, type: true, url: true, sizeInBytes: true, MaterialPage: { orderBy: { pageNumber: 'asc' } } },
       });
       if (found) {
         material = await serializeMaterialWithPages(found, found.MaterialPage);
