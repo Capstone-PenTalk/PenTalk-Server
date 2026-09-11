@@ -1803,8 +1803,20 @@ app.post(ROUTES.SESSION_END, requireAuth, requireTeacherRole, async (req, res) =
 });
 
 // ✅ #42: 판서 데이터 조회 API (ARCHIVED → 파일, ACTIVE → Redis)
+// ✅ 복습 화면용: materialId + pageNumber 쿼리로 ARCHIVED 세션의 특정 페이지 판서만 필터링 조회 가능
 app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
   const { sessionId } = req.params;
+
+  // materialId/pageNumber는 둘 다 오거나 둘 다 없어야 함 (하나만 오면 잘못된 요청)
+  const hasFilterQuery = req.query.materialId !== undefined || req.query.pageNumber !== undefined;
+  const filterMaterialId = typeof req.query.materialId === 'string' ? req.query.materialId.trim() : '';
+  const filterPageNumber = Number(req.query.pageNumber);
+  const isValidFilter =
+    filterMaterialId !== '' && Number.isInteger(filterPageNumber) && filterPageNumber >= 1;
+
+  if (hasFilterQuery && !isValidFilter) {
+    return sendHttpError(res, 400, ERRORS.PAYLOAD_INVALID, "INVALID_WHITEBOARD_QUERY");
+  }
 
   try {
     // ARCHIVED 여부 DB 확인
@@ -1819,7 +1831,13 @@ app.get(ROUTES.WHITEBOARD_GET, requireAuth, async (req, res) => {
       }
       const raw = await downloadString(dbSession.drawingPath);
       const data = JSON.parse(raw);
-      return res.json({ sessionId, readOnly: true, strokes: (data.strokes ?? []).map(normalizeStroke) });
+      let strokes = Array.isArray(data.strokes) ? data.strokes : [];
+      if (isValidFilter) {
+        strokes = strokes.filter(
+          (s) => s?.materialId === filterMaterialId && Number(s?.pageNumber) === filterPageNumber
+        );
+      }
+      return res.json({ sessionId, readOnly: true, strokes: strokes.map(normalizeStroke) });
     }
 
     // ACTIVE: Redis에서 조회
