@@ -3670,7 +3670,7 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     // 4) 해당 학생에게만 전송 (온라인인 경우)
     const presence       = getSessionPresence(sessionId);
     const studentKey     = `student:${question.userId}`;
-    const targetSocketId = presence.get(studentKey);
+    const targetSocketId = presence.get(studentKey)?.socketId;
     if (targetSocketId) {
       io.to(targetSocketId).emit(SOCKET_EVENTS.QUESTION_ANSWERED, notifyPayload);
     }
