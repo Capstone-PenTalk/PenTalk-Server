@@ -254,9 +254,9 @@ function getSessionPresence(roomId) {
 function buildPresenceList(roomId) {
   const m = presenceBySession.get(roomId);
   if (!m) return [];
-  return Array.from(m.keys()).map((k) => {
+  return Array.from(m.entries()).map(([k, v]) => {
     const [role, userId] = k.split(":");
-    return { userId, role };
+    return { userId, role, name: v?.name ?? null, studentNumber: v?.studentNumber ?? null };
   });
 }
 
@@ -3133,12 +3133,19 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       await pipeline.exec();
     }
 
+    // ✅ 참여자 목록 표시용 이름/학번 조회 (teacher 화면에 원본 userId 대신 노출)
+    const presenceUser = await prisma.user
+      .findUnique({ where: { id: socket.data.userId }, select: { name: true, studentNumber: true } })
+      .catch(() => null);
+    socket.data.name = presenceUser?.name ?? null;
+    socket.data.studentNumber = presenceUser?.studentNumber ?? null;
+
     // ✅ #38: presence 입장 처리
     const sessionPresence = getSessionPresence(roomId);
     const meKey = userKeyOf(socket);
 
     // 중복 접속 처리: 같은 userId+role이 이미 접속 중이면 기존 소켓 끊기
-    const existingSocketId = sessionPresence.get(meKey);
+    const existingSocketId = sessionPresence.get(meKey)?.socketId;
     if (existingSocketId && existingSocketId !== socket.id) {
       const oldSocket = io.sockets.sockets.get(existingSocketId);
       if (oldSocket) oldSocket.disconnect(true);
@@ -3146,7 +3153,11 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
     }
 
     // 현재 소켓 등록
-    sessionPresence.set(meKey, socket.id);
+    sessionPresence.set(meKey, {
+      socketId: socket.id,
+      name: socket.data.name,
+      studentNumber: socket.data.studentNumber,
+    });
 
     // 본인에게 현재 접속자 목록 전달
     socket.emit(SOCKET_EVENTS.PRESENCE_STATE, {
@@ -3160,6 +3171,8 @@ socket.on(SOCKET_EVENTS.JOIN_ROOM, async ({ roomId, classId, materialId }) => {
       roomId,
       userId: socket.data.userId,
       role: socket.data.role,
+      name: socket.data.name,
+      studentNumber: socket.data.studentNumber,
     });
 
   });
@@ -4286,7 +4299,7 @@ socket.on(SOCKET_EVENTS.DRAW_APPEND, async (payload) => {
     if (!sessionPresence) return;
 
     const meKey = userKeyOf(socket);
-    const existingSocketId = sessionPresence.get(meKey);
+    const existingSocketId = sessionPresence.get(meKey)?.socketId;
 
     // 현재 끊기는 소켓이 등록된 소켓일 때만 제거 (중복 접속 race 방어)
     if (existingSocketId === socket.id) {
